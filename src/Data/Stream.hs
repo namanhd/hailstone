@@ -1,6 +1,6 @@
 module Data.Stream where 
 
-import Prelude hiding (splitAt, head, tail, zipWith, repeat, interleave)
+import Prelude hiding (splitAt, head, tail, zipWith, repeat)
 
 -- | Infinite list. 
 -- Definitions are selections from this module
@@ -33,11 +33,11 @@ splitAt n xs
 
 -- | Get the head of the stream.
 head :: Stream a -> a 
-head (Cons x _) = x
+head ~(Cons x _) = x
 
 -- | Get the stream but without its head.
 tail :: Stream a -> Stream a
-tail (Cons _ xs) = xs
+tail ~(Cons _ xs) = xs
 
 -- | Combine two streams into one using a pointwise function.
 zipWith :: (a -> b -> c) -> Stream a -> Stream b -> Stream c

@@ -7,16 +7,16 @@ import Sound.Hailstone.SDLAudio
 import Control.Concurrent (threadDelay)
 
 testSong :: [Cell]
-testSong = [ 
-  Cell 440 0.25 0.5, Cell 550 0.25 0.5, Cell 660 0.25 1.0,
-  Cell 660 0.0 1.0,
-  Cell 660 0.25 0.5, Cell 550 0.25 0.5, Cell 440 0.25 1.0]
+testSong = let nop = Nothing in [ 
+  Cell 440 0.25 0.5 nop, Cell 550 0.25 0.5 nop, Cell 660 0.25 1.0 nop,
+  Cell 660 0.0 1.0 nop,
+  Cell 660 0.25 0.5 nop, Cell 550 0.25 0.5 nop, Cell 440 0.25 1.0 nop]
 
 testSong2Chords :: [[Cell]]
-testSong2Chords = let dur = 0.5; vol = 0.25 in
+testSong2Chords = let dur = 0.7; vol = 0.25; panL = Just 0.2; panR = Just 0.8 in
   [
-    [Cell (0.5 * 440) vol dur, Cell (0.5 * 440 * 4 / 3) vol dur, Cell (0.5 * 440 * 8/9) vol dur],
-    [Cell (440 * 5/6) vol dur, Cell (440 * (4/3) * (5/4)) vol dur, Cell (440 * (8/9) * (5/4)) vol dur]
+    [Cell (0.5 * 440) vol dur panL, Cell (0.5 * 440 * 4 / 3) vol dur panL, Cell (0.5 * 440 * 8/9) vol dur panL],
+    [Cell (440 * 5/6) vol dur panR, Cell (440 * (4/3) * (5/4)) vol dur (Just 0.1), Cell (440 * (8/9) * (5/4)) vol dur panR]
   ]
 
 -- | A test synth sound that works well as a SNES sample-like chord/keys sound
@@ -64,20 +64,21 @@ applyLPfilter wndSize = constConvolve wndSize (windowWeights wndSize)
 tonetestmainSDL :: IO ()
 tonetestmainSDL = do
   let sampleRate = 44100
-      bufferSize = 8192
+      bufferSize = 4096
+      chanMode = Stereo
   putStrLn "Opening audio"
-  (audioDevice, mvSampleSrc) <- openAudio sampleRate bufferSize
+  (audioDevice, mvSampleSrc) <- openAudio sampleRate bufferSize chanMode
   putStrLn "Making song sample stream"
   let ts = timesteps sampleRate
       -- summedSrc = applyLPfilter 3 $ retriggerWithNotes 0.0 0.0 ts testSynth1 testSong
-      playNotes notes = applyLPfilter 3 $ retriggerWithNotes 0.0 0.0 ts testSynth1 notes
+      playNotes notes = applyLPfilter 3 $ retriggerWithNotes chanMode 0.0 0.0 ts testSynth1 notes
       summedSrc = mixAll $ playNotes <$> testSong2Chords
       sampSrc = asPCM summedSrc
       
   putSampleSource mvSampleSrc sampSrc
   enableAudio audioDevice
   putStrLn "Starting play"
-  let runDuration = 5.0 :: TimeVal
+  let runDuration = 3.0 :: TimeVal
   threadDelay (round $ runDuration * 1000000)
 
   putStrLn "Done waiting"

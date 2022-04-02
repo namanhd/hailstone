@@ -1,6 +1,7 @@
 module Sound.Hailstone.Synth 
 ( -- * Type synonyms and datatypes
   Freq, Vol, SampleRate, TimeVal, SampleVal
+, ChanMode(..)
 , Cell(..)
   -- ** Stream types
 , Stream
@@ -17,10 +18,11 @@ module Sound.Hailstone.Synth
 , waveformSource, sinSource, squareSource
   -- ** Combining and manipulating streams
 , clip, mix, mixAll, (|+|), (|*|), scale, (*|)
-, constConvolve, varConvolve, interleave
+, constConvolve, varConvolve
+, interleave, constStereoize, varStereoize
   -- ** Sequencing streams
 , piecewise
-, notesToFreqsVols, retriggerWithNotes
+, notesToStreams, retriggerWithNotes
 )
 where
 
@@ -30,9 +32,17 @@ import qualified Data.Stream as STR
 -- | Frequency value type in Hz; must be positive.
 type Freq = Double
 
--- | Volume/amplitude values as percentages, which must be between 0 and 1
--- (inclusive).
+-- | Volume/amplitude as a scale factor; normally between -1 and 1 when creating
+-- signals that go to the speakers but for modulators this can just be anything.
 type Vol = Double
+
+-- | Panning percentage as percentage Right; i.e. 0.0 is hard left, 0.5 is
+-- centered, and 1.0 is hard right.
+type Pan = Double
+
+-- | Constants denoting mono and stereo (easier to read than Bools for the job.)
+data ChanMode = Mono | Stereo
+  deriving (Show, Eq)
 
 -- | Sample rate value in Hz (e.g. 44100 Hz, 48000 Hz)
 type SampleRate = Int
@@ -45,8 +55,16 @@ type TimeVal = Double
 -- signed integer audio.
 type SampleVal = Int16
 
--- | Note data cell; stores some basic playing properties of a note
-data Cell = Cell { freqOf :: Freq, volOf :: Vol, durOf :: TimeVal }
+-- | Note data cell; stores some basic playing properties of a note.
+data Cell = Cell 
+  { freqOf :: Freq    -- ^Frequency of the note
+  , volOf :: Vol      -- ^Volume of the note (should be between 0.0 and 1.0)
+  , durOf :: TimeVal  -- ^Duration of the note in seconds
+  , panOf :: Maybe Pan 
+  -- ^The panning value is a `Maybe Pan` so that a pan value of `Nothing` should
+  -- result in the note being played as a true mono signal, while @`Just` p@
+  -- would imply a note to be played at panning value @p@ in stereo.
+  }
   deriving (Show, Eq)
 
 -- | Re-export from `STR.Stream`; a shorthand for convenience
@@ -55,6 +73,11 @@ type Stream = STR.Stream
 -- | Type representing streams containing audio sample values, to be consumed by
 -- the audio backend
 type SampleSource = Stream SampleVal
+
+-- | Unwraps Maybe Pan. Only useful if we're doing any sort of stereo at all;
+-- defaults Nothing pan to mean 0.5
+unmaybePan :: Maybe Pan -> Pan
+unmaybePan = maybe 0.5 id
 
 -- | Create a stream of "time step values" t (for waveform-generating
 -- functions), sampled depending on the sample rate
@@ -85,19 +108,20 @@ infixr 5 *|
 -- two functions.
 constConvolve :: (Num a) => Int -> [a] -> Stream a -> Stream a
 constConvolve wndSize weights src = let window = fst $ STR.splitAt wndSize src in
-  STR.Cons (sum $ zipWith (*) weights window) (constConvolve wndSize weights $ STR.tail src)
+  STR.Cons (sum $ zipWith (*) weights window) 
+    (constConvolve wndSize weights $ STR.tail src)
 
 -- | Like `constConvolve` but the window size and conv weight lists are also
 -- streams.
 varConvolve :: (Num a) => Stream Int -> Stream [a] -> Stream a -> Stream a
-varConvolve (STR.Cons wndSize wndRest) (STR.Cons weights weightRest) src@(STR.Cons _ xs) = 
-  STR.Cons (sum $ zipWith (*) weights window) (varConvolve wndRest weightRest xs)
+varConvolve (STR.Cons wndSize wnds) (STR.Cons weights wts) src@(STR.Cons _ xs) = 
+  STR.Cons (sum $ zipWith (*) weights window) (varConvolve wnds wts xs)
   where
     window = fst $ STR.splitAt wndSize src
 
 -- | Mix two streams with addition.
 mix :: (Num a) => Stream a -> Stream a -> Stream a
-mix s1 s2 = (+) <$> s1 <*> s2
+mix s1 s2 = STR.zipWith (+) s1 s2
 
 -- | Infix version of `mix`.
 (|+|) :: (Num a) => Stream a -> Stream a -> Stream a
@@ -107,7 +131,7 @@ infixl 3 |+|
 -- | Since we have `|+|`, we might as well have `|*|` which multiplies two 
 -- streams pointwise.
 (|*|) :: (Num a) => Stream a -> Stream a -> Stream a
-(|*|) s1 s2 = (*) <$> s1 <*> s2
+(|*|) s1 s2 = STR.zipWith (*) s1 s2
 infixl 4 |*|
 
 -- | Interleaves two streams together e.g. to make a stereo signal. Re-exports
@@ -124,6 +148,20 @@ mixAll = foldl1 mix
 -- scaling up to sample values followed by rounding and clipping
 asPCM :: Stream Double -> SampleSource
 asPCM = clip . fmap round . scale (fromIntegral (maxBound :: SampleVal))
+
+-- | Interleave a stream with itself and apply some panning to turn a mono
+-- stream into a stereo stream. Note that pan values are from 0. to 1., where
+-- 0.0 is hard left, 0.5 is centered, and 1.0 is hard right. (Though, no
+-- bounds checking is done to ensure this.)
+constStereoize :: (Num a) => a -> Stream a -> Stream a
+constStereoize pan s = interleave (scale (1 - pan) s) (scale pan s)
+
+-- | The stream-parameterized version of `constStereoize`, where pan values 
+-- may come in a stream rather than as a constant. This requires some special
+-- swizzling and we can't just use the stock interleave function.
+varStereoize :: (Num a) => Stream a -> Stream a -> Stream a
+varStereoize ~(STR.Cons p ps) ~(STR.Cons x xs) = 
+  STR.Cons ((1 - p) * x) $ STR.Cons (p * x) $ varStereoize ps xs
 
 -- | Generic waveform source (a waveform function that can be used is any
 -- @(Double -> Double)@ function with domain [0, inf) and range [-1, 1]).
@@ -166,10 +204,13 @@ cascadeMap baseAccumVal accumFn decorateFn (a:as) =
 -- they should play for. The input should be a list of @[(source, duration)]@
 -- for each source that plays for each duration, sequenced together in the order
 -- they're in in the list. 
-piecewise :: a -> TimeVal -> [(Stream a, TimeVal)] -> Stream TimeVal -> Stream a
-piecewise emptyVal startAt sourcesDurations timeSrc = 
-  customMap sourcesAbsoluteTimes timeSrc
+piecewise :: ChanMode -> a -> TimeVal -> [(Stream a, TimeVal)] -> Stream TimeVal -> Stream a
+piecewise chanMode emptyVal startAt sourcesDurations timeSrc = 
+  customMap sourcesAbsoluteTimes timeSrcAtChanMode
   where
+    timeSrcAtChanMode = case chanMode of
+      Mono -> timeSrc
+      Stereo -> interleave timeSrc timeSrc
     sourcesAbsoluteTimes = fst $ cascadeMap startAt 
       (\acc (_  , dur) -> acc + dur) 
       (\acc (src, dur) -> (src, dur, acc)) 
@@ -191,30 +232,49 @@ piecewise emptyVal startAt sourcesDurations timeSrc =
 
 
 -- | Convenience wrapper over `piecewise` to compose a source that plays out the
--- sequence of frequencies + volumes.
-notesToFreqsVols :: TimeVal -- ^start offset time of the melody line
-              -> Stream TimeVal -- ^time step stream
-              -> [Cell] -- ^note data cells making up the melody
-              -> (Stream Freq, Stream Vol) -- ^frequency and volume sources
-notesToFreqsVols startAt ts cells = (fs, vs)
+-- sequence of frequencies + volumes according to some note data (as `Cell`s)
+notesToStreams :: ChanMode 
+               -> TimeVal -- ^start offset time of the melody line
+               -> Stream TimeVal -- ^time step stream
+               -> [Cell] -- ^note data cells making up the melody
+               -> (Stream Freq, Stream Vol, Stream Pan) -- ^frequency, volume, panning streams
+notesToStreams chanMode startAt ts cells = (fs, vs, ps)
   where
-    go mapper = piecewise 0 startAt (mapper <$> cells) ts
+    go mapper = piecewise chanMode 0 startAt (mapper <$> cells) ts
     fs = go (\cell -> (pure (freqOf cell), durOf cell))
     vs = go (\cell -> (pure (volOf  cell), durOf cell))
+    ps = case chanMode of 
+      Mono -> pure 0.5 -- because the user passed in Mono/Stereo, they must know
+      -- to not have any use for this pure 0.5 stream... unless they want to use
+      -- this in an otherwise stereo mix of sources?
+      Stereo -> go (\cell -> (pure . unmaybePan $ panOf cell, durOf cell))
 
--- | By default, modulating an "instrument" stream's frequency with the frequency and
--- volume streams created from `notesToFreqsVols` will simply superimpose the melody
--- on top of the carrier sound, which may evolve independently of the notes.
--- In order to achieve a "keystroke"/"instrument retrigger" effect, this function
--- allows one to "reset and retrigger" a stream in sync with note data.
-retriggerWithNotes  :: a -- ^empty value for when notes have concluded
+-- | This is what is probably most commonly understood as "playing a melody with
+-- a synth". By default, simply modulating an "instrument" stream's frequency
+-- with the frequency and volume streams created from `notesToStreams` will
+-- simply superimpose the melody on top of the carrier sound, which may evolve
+-- independently of the note frequencies. In order to achieve a
+-- "keystroke"/"instrument retrigger" effect, this function allows one to "reset
+-- and retrigger" a stream in sync with note data. This will work on any streams
+-- that are parameterized by a frequency, volume, and timestep (i.e. a synth
+-- source); in addition, panning will be applied if stereo output is desired.
+retriggerWithNotes  :: ChanMode -- ^specify `Mono` or `Stereo`; Mono will ignore the `Cell`s' `panOf` value.
+                    -> Double -- ^empty value for when notes have concluded
                     -> TimeVal -- ^start offset time of the melody line
                     -> Stream TimeVal -- ^time step stream
-                    -> (Stream Freq -> Stream Vol -> Stream TimeVal -> Stream a) -- ^stream to retrigger in sync with notes, parameterized by the f and vol to play at
+                    -> (Stream Freq -> Stream Vol -> Stream TimeVal -> Stream Double) 
+                        -- ^stream to retrigger in sync with notes, parameterized
+                        -- by frequency, volume, and timestep 
                     -> [Cell] -- ^note data cells making up the melody
-                    -> Stream a
-retriggerWithNotes emptyVal startAt ts sfunc cells = piecewise emptyVal startAt 
-  ((\cell -> (sfunc (pure $ freqOf cell) (pure $ volOf cell) ts, durOf cell)) <$> cells) ts
+                    -> Stream Double
+retriggerWithNotes chanMode emptyVal startAt ts sfunc cells = 
+  piecewise chanMode emptyVal startAt 
+    ((\cell -> ( doPanning (panOf cell) $ sfunc (pure $ freqOf cell) (pure $ volOf cell) ts
+      , durOf cell )) <$> cells) ts
+  where
+    doPanning maybePan = case chanMode of
+      Mono -> id
+      Stereo -> constStereoize $ unmaybePan maybePan
 
 -- | Consume values from a sample source and produce a list of PCM samples and
 -- the remainder of the source

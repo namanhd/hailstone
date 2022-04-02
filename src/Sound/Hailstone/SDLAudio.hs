@@ -19,7 +19,7 @@ import qualified Data.Vector.Storable.Mutable as SMV
 import Control.Monad (zipWithM_)
 
 -- for SampleSource
-import Sound.Hailstone.Synth (SampleSource, SampleRate, consumeSource)
+import Sound.Hailstone.Synth (SampleSource, SampleRate, consumeSource, ChanMode(..))
 
 -- | SDL audio callback function; called whenever SDL needs more data in the
 -- audio buffer. This should copy samples into the buffer, or pad with silence
@@ -44,11 +44,13 @@ sdlAudioCallback mSource sdlAudioFormat sdlAudioBuffer = case sdlAudioFormat of
 
 -- | Initialize SDL (the Audio subsystem only) given a sample rate and buffer
 -- size, and create an `MVar` to store the output `SampleSource` stream.
-openAudio :: SampleRate -> Word16 -> IO (SDL.AudioDevice, MVar SampleSource)
-openAudio sampleRate bufferSize = do
+openAudio :: SampleRate -> Word16 -> ChanMode -> IO (SDL.AudioDevice, MVar SampleSource)
+openAudio sampleRate bufferSize chanMode = do
   SDL.initialize [SDL.InitAudio]
-  let 
-      sampleType = SDL.Signed16BitNativeAudio
+  let sampleType = SDL.Signed16BitNativeAudio
+      stereoMode = case chanMode of
+        Mono -> SDL.Mono
+        Stereo -> SDL.Stereo
   
   initialSource <- newMVar (pure 0)
   -- function "requests" an audio spec from the hardware, using the
@@ -59,7 +61,7 @@ openAudio sampleRate bufferSize = do
   (device, _) <- SDL.openAudioDevice SDL.OpenDeviceSpec
     { SDL.openDeviceFreq = SDL.Mandate $ fromIntegral sampleRate
     , SDL.openDeviceFormat = SDL.Mandate sampleType
-    , SDL.openDeviceChannels = SDL.Mandate SDL.Mono
+    , SDL.openDeviceChannels = SDL.Mandate stereoMode
     , SDL.openDeviceSamples = bufferSize
     , SDL.openDeviceCallback = sdlAudioCallback initialSource
     , SDL.openDeviceUsage = SDL.ForPlayback
