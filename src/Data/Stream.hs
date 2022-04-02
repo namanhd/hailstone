@@ -12,12 +12,12 @@ data Stream a = Cons a (Stream a)
 instance Functor Stream where
   fmap f ~(Cons x xs) = Cons (f x) (fmap f xs)
 
--- | This will allow us to build synthesis functions out of <$> and <*>
+-- | This will allow us to build synthesis functions out of `<$>` and `<*>`
 instance Applicative Stream where
   pure = repeat
   (<*>) ~(Cons f fs) ~(Cons x xs) = Cons (f x) (fs <*> xs)
 
--- TODO monad instance )follow Conduit's explanation); 
+-- TODO monad instance (follow Conduit's explanation); 
 -- though Functor and Applicative are all that is needed
 -- for most of the modulation functionality, so this is going to be left at this
 -- most likely
@@ -48,7 +48,8 @@ repeat :: a -> Stream a
 repeat x = Cons x (repeat x)
 
 -- | Build a stream from a bog-standard Prelude infinite list. This is to
--- leverage the built-in syntax sugar for infinite lists (i.e. the [n..] syntax)
+-- leverage the built-in syntax sugar for infinite lists (i.e. the 
+-- @[n..]@ syntax)
 fromInfList :: [a] -> Stream a
 fromInfList (x:xs) = Cons x (fromInfList xs)
 fromInfList [] = error "invalid to turn a finite list into a stream!"

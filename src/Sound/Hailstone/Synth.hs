@@ -1,36 +1,63 @@
-module Hailstone.Synth 
-( Freq, Vol, SampleRate, TimeVal, SampleVal
+module Sound.Hailstone.Synth 
+( -- * Type synonyms and datatypes
+  Freq, Vol, SampleRate, TimeVal, SampleVal
 , Cell(..)
+  -- ** Stream types
 , Stream
 , SampleSource
+  -- * Functions
+  -- ** For processing a stream at the audio backend level
 , consumeSource
 , asPCM
-
-, timesteps, clip, mix, zeros
+  -- ** Creating primitive streams
+  -- | Note that thanks to the @Applicative@ instance of `Stream`, the function
+  -- `pure` is available to lift any value of type @a@ into @`Stream` a@, which
+  -- will infinitely repeat the value.
+, timesteps, zeros
+  -- ** Combining and processing streams
+, clip, mix, constConvolve, varConvolve
+  -- ** Creating waveform streams
 , waveformSource, sinSource, squareSource
+  -- ** Sequencing of streams
 , piecewise
-, notesToSource
+, notesToFreqsVols, retriggerWithNotes
 )
 where
 
 import Data.Int (Int16)
 import qualified Data.Stream as STR
 
+-- | Frequency value type in Hz; must be positive.
 type Freq = Double
+
+-- | Volume/amplitude values as percentages, which must be between 0 and 1
+-- (inclusive).
 type Vol = Double
+
+-- | Sample rate value in Hz (e.g. 44100 Hz, 48000 Hz)
 type SampleRate = Int
+
+-- | A time value type, which is used in both time tick values (see `timesteps`)
+-- and durations (see `Cell`, `piecewise`, and related functions)
 type TimeVal = Double
+
+-- | Type of a value to be sent to the audio backend. Here we use 16-bit
+-- signed integer audio.
 type SampleVal = Int16
 
 -- | Note data cell; stores some basic playing properties of a note
 data Cell = Cell { freqOf :: Freq, volOf :: Vol, durOf :: TimeVal }
   deriving (Show, Eq)
 
-type Stream = STR.Stream -- shorthand for convenience
+-- | Re-export from `STR.Stream`; a shorthand for convenience
+type Stream = STR.Stream
+
+-- | Type representing streams containing audio sample values, to be consumed by
+-- the audio backend
 type SampleSource = Stream SampleVal
 
--- | A stream of "time step values" t (for waveform-generating functions), 
--- sampled depending on the sample rate
+-- | Create a stream of "time step values" t (for waveform-generating
+-- functions), sampled depending on the sample rate
 timesteps :: SampleRate -> Stream TimeVal
 timesteps sampleRate = ((1/fromIntegral sampleRate) *) <$> STR.fromInfList [0 :: TimeVal ..]
 
@@ -42,6 +69,27 @@ clip = fmap (min (maxBound :: SampleVal)) . fmap (max (minBound :: SampleVal))
 scale :: (Num a) => a -> Stream a -> Stream a
 scale multiplier = fmap (multiplier *)
 
+-- | Create a stream by convolving (sliding-window weighted average) over an
+-- existing stream. Effectively a low-pass filter, but one can specify weights
+-- for the convolution filter. The list of weights should have (technically at
+-- least, but ideally exactly) @windowSize@ elements. The bigger the window, the
+-- "smoother" the signal becomes, though it also depends on the weights. This is
+-- `constConvolve` to contrast with `varConvolve` whose parameters are
+-- modulatable via Streams. The interface for that is quite a bit more hefty
+-- (and constConvolve is already convoluted enough (hah)) so I've separated the
+-- two functions.
+constConvolve :: (Num a) => Int -> [a] -> Stream a -> Stream a
+constConvolve wndSize weights src = let window = fst $ STR.splitAt wndSize src in
+  STR.Cons (sum $ zipWith (*) weights window) (constConvolve wndSize weights $ STR.tail src)
+
+-- | Like `constConvolve` but the window size and conv weight lists are also
+-- streams.
+varConvolve :: (Num a) => Stream Int -> Stream [a] -> Stream a -> Stream a
+varConvolve (STR.Cons wndSize wndRest) (STR.Cons weights weightRest) src@(STR.Cons _ xs) = 
+  STR.Cons (sum $ zipWith (*) weights window) (varConvolve wndRest weightRest xs)
+  where
+    window = fst $ STR.splitAt wndSize src
+
 -- | Mix two sample sources (actually defined to be a bit more general
 -- to work on any stream of values that can do addition).
 mix :: (Num a) => Stream a -> Stream a -> Stream a
@@ -52,20 +100,20 @@ zeros :: SampleSource
 zeros = pure 0
 
 -- | Convert a double-generating source (such as a raw waveform stream) into a
--- stream of audio sample values in our audio setup (here, Int16), with scaling
--- up to sample values followed by rounding and clipping
+-- stream of audio sample values in our audio setup (here, @Int16@), with
+-- scaling up to sample values followed by rounding and clipping
 asPCM :: Stream Double -> SampleSource
 asPCM = clip . fmap round . scale (fromIntegral (maxBound :: SampleVal))
 
 -- | Generic waveform source (a waveform function that can be used is any
--- (Double -> Double) function with domain [0, inf) and range [-1, 1])
+-- @(Double -> Double)@ function with domain [0, inf) and range [-1, 1]).
 waveformSource :: (Double -> Double) -> Stream Freq -> Stream Vol -> Stream TimeVal -> Stream Double
 waveformSource waveFn fs vs ts = (\f v t -> v * waveFn (f * t)) <$> fs <*> vs <*> ts
 
 -- | Sinusoidal waveform source; supports modulation of phase, frequency,
--- volume, and time scale. TODO use a fastSin instead of this maybe
+-- volume, and time scale.
 sinSource :: Stream Double -> Stream Freq -> Stream Vol -> Stream TimeVal -> Stream Double
-sinSource phases fs vs ts = 
+sinSource phases fs vs ts = -- TODO use a fastSin instead of this maybe 
   (\ph f v t -> v * sin (2 * pi * f * t + ph)) <$> phases <*> fs <*> vs <*> ts
 
 -- | Square waveform source; supports modulation of frequency, volume, and time
@@ -75,7 +123,7 @@ squareSource fs vs ts = (\f v t -> let ft = f * t in v * fromIntegral
   ((2 * (2 * floor ft - floor (2 * ft)) + 1) :: Int)) <$> fs <*> vs <*> ts
 
 
--- | Funny fold/mapAccum-ish helper for `piecewise`, but may be useful
+-- | Funny @fold@/@mapAccum@-ish helper for `piecewise`, but may be useful
 -- elsewhere. Carries out a foldl with a base accumulator value and an
 -- accumulator function but also takes a "decorator function" as argument to
 -- combine the current list item with the current accumulator value and obtain
@@ -83,9 +131,9 @@ squareSource fs vs ts = (\f v t -> let ft = f * t in v * fromIntegral
 -- case is to "decorate" the list with the accumulator value alongside folding.
 -- Outputs both the accumulator result and the resulting decorated list.
 -- Example usage:
--- > ghci> cascadeMap 0 (\acc (c, n) -> acc + n) (\acc (c, n) -> (c, n, acc)) 
--- >       $ [('a',1),('b',5),('c',3)]
--- > ([('a',1,0),('b',5,1),('c',3,6)],9)
+-- >>> cascadeMap 0 (\acc (c, n) -> acc + n) (\acc (c, n) -> (c, n, acc)) 
+-- >>>    $ [('a',1),('b',5),('c',3)]
+-- ([('a',1,0),('b',5,1),('c',3,6)],9)
 cascadeMap :: x -> (x -> a -> x) -> (x -> a -> b) -> [a] -> ([b], x)
 cascadeMap baseAccumVal _ _ [] = ([], baseAccumVal)
 cascadeMap baseAccumVal accumFn decorateFn (a:as) = 
@@ -94,16 +142,16 @@ cascadeMap baseAccumVal accumFn decorateFn (a:as) =
   in  ((decorateFn baseAccumVal a):rList, rAccum)
 
 
--- | Splice together segments from different sources depending on the
--- duration they should play for. The input should be a list of 
--- [(source, duration)] for each source that plays for each duration, sequenced
--- together in the order they're in in the list. 
+-- | Splice together segments from different sources depending on the duration
+-- they should play for. The input should be a list of @[(source, duration)]@
+-- for each source that plays for each duration, sequenced together in the order
+-- they're in in the list. 
 piecewise :: a -> TimeVal -> [(Stream a, TimeVal)] -> Stream TimeVal -> Stream a
 piecewise emptyVal startAt sourcesDurations timeSrc = 
   customMap sourcesAbsoluteTimes timeSrc
   where
     sourcesAbsoluteTimes = fst $ cascadeMap startAt 
-      (\acc (src, dur) -> acc + dur) 
+      (\acc (_  , dur) -> acc + dur) 
       (\acc (src, dur) -> (src, dur, acc)) 
       sourcesDurations
 
@@ -123,16 +171,30 @@ piecewise emptyVal startAt sourcesDurations timeSrc =
 
 
 -- | Convenience wrapper over `piecewise` to compose a source that plays out the
--- sequence of frequencies + volumes
-notesToSource :: TimeVal -- ^start offset time of the melody line
+-- sequence of frequencies + volumes.
+notesToFreqsVols :: TimeVal -- ^start offset time of the melody line
               -> Stream TimeVal -- ^time step stream
               -> [Cell] -- ^note data cells making up the melody
               -> (Stream Freq, Stream Vol) -- ^frequency and volume sources
-notesToSource startAt ts cells = (fs, vs)
+notesToFreqsVols startAt ts cells = (fs, vs)
   where
-    fs = piecewise 0 startAt ((\(Cell f v d) -> (pure f, d)) <$> cells) ts
-    vs = piecewise 0 startAt ((\(Cell f v d) -> (pure v, d)) <$> cells) ts
+    go mapper = piecewise 0 startAt (mapper <$> cells) ts
+    fs = go (\cell -> (pure (freqOf cell), durOf cell))
+    vs = go (\cell -> (pure (volOf  cell), durOf cell))
 
+-- | By default, modulating an "instrument" stream's frequency with the frequency and
+-- volume streams created from `notesToFreqsVols` will simply superimpose the melody
+-- on top of the carrier sound, which may evolve independently of the notes.
+-- In order to achieve a "keystroke"/"instrument retrigger" effect, this function
+-- allows one to "reset and retrigger" a stream in sync with note data.
+retriggerWithNotes  :: a -- ^empty value for when notes have concluded
+                    -> TimeVal -- ^start offset time of the melody line
+                    -> Stream TimeVal -- ^time step stream
+                    -> (Stream Freq -> Stream Vol -> Stream TimeVal -> Stream a) -- ^stream to retrigger in sync with notes, parameterized by the f and vol to play at
+                    -> [Cell] -- ^note data cells making up the melody
+                    -> Stream a
+retriggerWithNotes emptyVal startAt ts sfunc cells = piecewise emptyVal startAt 
+  ((\cell -> (sfunc (pure $ freqOf cell) (pure $ volOf cell) ts, durOf cell)) <$> cells) ts
 
 -- | Consume values from a sample source and produce a list of PCM samples and
 -- the remainder of the source
