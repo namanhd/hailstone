@@ -9,16 +9,16 @@ module Sound.Hailstone.Synth
   -- ** For processing a stream at the audio backend level
 , consumeSource
 , asPCM
-  -- ** Creating primitive streams
+  -- ** Creating streams
   -- | Note that thanks to the @Applicative@ instance of `Stream`, the function
   -- `pure` is available to lift any value of type @a@ into @`Stream` a@, which
   -- will infinitely repeat the value.
-, timesteps, zeros
-  -- ** Combining and processing streams
-, clip, mix, constConvolve, varConvolve
-  -- ** Creating waveform streams
+, timesteps
 , waveformSource, sinSource, squareSource
-  -- ** Sequencing of streams
+  -- ** Combining and manipulating streams
+, clip, mix, mixAll, (|+|), (|*|), scale, (*|)
+, constConvolve, varConvolve, interleave
+  -- ** Sequencing streams
 , piecewise
 , notesToFreqsVols, retriggerWithNotes
 )
@@ -69,6 +69,11 @@ clip = fmap (min (maxBound :: SampleVal)) . fmap (max (minBound :: SampleVal))
 scale :: (Num a) => a -> Stream a -> Stream a
 scale multiplier = fmap (multiplier *)
 
+-- | Infix version of `scale`.
+(*|) :: (Num a) => a -> Stream a -> Stream a
+(*|) = scale
+infixr 5 *|
+
 -- | Create a stream by convolving (sliding-window weighted average) over an
 -- existing stream. Effectively a low-pass filter, but one can specify weights
 -- for the convolution filter. The list of weights should have (technically at
@@ -90,14 +95,29 @@ varConvolve (STR.Cons wndSize wndRest) (STR.Cons weights weightRest) src@(STR.Co
   where
     window = fst $ STR.splitAt wndSize src
 
--- | Mix two sample sources (actually defined to be a bit more general
--- to work on any stream of values that can do addition).
+-- | Mix two streams with addition.
 mix :: (Num a) => Stream a -> Stream a -> Stream a
-mix s1 s2 = STR.zipWith (+) s1 s2
+mix s1 s2 = (+) <$> s1 <*> s2
 
--- | All-zeroes stream of samples.
-zeros :: SampleSource
-zeros = pure 0
+-- | Infix version of `mix`.
+(|+|) :: (Num a) => Stream a -> Stream a -> Stream a
+(|+|) = mix
+infixl 3 |+|
+
+-- | Since we have `|+|`, we might as well have `|*|` which multiplies two 
+-- streams pointwise.
+(|*|) :: (Num a) => Stream a -> Stream a -> Stream a
+(|*|) s1 s2 = (*) <$> s1 <*> s2
+infixl 4 |*|
+
+-- | Interleaves two streams together e.g. to make a stereo signal. Re-exports
+-- the same function from "Data.Stream".
+interleave :: (Num a) => Stream a -> Stream a -> Stream a
+interleave = STR.interleave
+
+-- | Mix a list of streams.
+mixAll :: (Num a) => [Stream a] -> Stream a
+mixAll = foldl1 mix
 
 -- | Convert a double-generating source (such as a raw waveform stream) into a
 -- stream of audio sample values in our audio setup (here, @Int16@), with

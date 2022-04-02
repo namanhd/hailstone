@@ -30,12 +30,12 @@ testSynth1 fs vs ts = finalSrc
 
     -- Two submodulators,  each synced with (a function of) note frequencies
     sinModulatorSub1 = sinSourceT (pure 0.0) (fs) (pure 1.0)
-    sinModulatorSub2 = sinSourceT (pure 0.0) ((2*)<$> fs) (pure 1.0)
+    sinModulatorSub2 = sinSourceT (pure 0.0) (2 *| fs) (pure 1.0)
     
     -- The submodulators modulate the phase of these modulators, whose
     -- frequency is also synced with a function of note frequencies
-    sinModulator1 = sinSourceT sinModulatorSub1 ((2 *)<$> fs) (pure 1.0)
-    sinModulator2 = sinSourceT sinModulatorSub2 ((3 *)<$> fs) (pure 0.8)
+    sinModulator1 = sinSourceT sinModulatorSub1 (2 *| fs) (pure 1.0)
+    sinModulator2 = sinSourceT sinModulatorSub2 (3 *| fs) (pure 0.8)
     
     -- Multiply the two modulators together
     sinModulator = (*) <$> sinModulator1 <*> sinModulator2
@@ -47,10 +47,10 @@ testSynth1 fs vs ts = finalSrc
     -- this is the actual carrier of the (vibrato-applied) note frequency
     sinCarrier = sinSourceT sinModulator (applyVibrato fs) vs
     -- add some overtones for an "additive synth" color
-    sinCarrierOvertone1 = sinSourceT sinModulator ((2*) <$> (applyVibrato fs)) ((0.3 *) <$> vs)
-    sinCarrierOvertone2 = sinSourceT sinModulator ((3*) <$> (applyVibrato fs)) ((0.15 *) <$> vs)
+    sinCarrierOvertone1 = sinSourceT sinModulator (2 *| applyVibrato fs) (0.3 *| vs)
+    sinCarrierOvertone2 = sinSourceT sinModulator (3 *| applyVibrato fs) (0.15 *| vs)
     -- mix the base carrier and its overtones
-    finalSrc = mix sinCarrier . mix sinCarrierOvertone1 $ sinCarrierOvertone2
+    finalSrc = sinCarrier |+| sinCarrierOvertone1 |+| sinCarrierOvertone2
 
 
 -- | Low pass filter
@@ -71,7 +71,7 @@ tonetestmainSDL = do
   let ts = timesteps sampleRate
       -- summedSrc = applyLPfilter 3 $ retriggerWithNotes 0.0 0.0 ts testSynth1 testSong
       playNotes notes = applyLPfilter 3 $ retriggerWithNotes 0.0 0.0 ts testSynth1 notes
-      summedSrc = foldl1 (\ta tb -> (+) <$> ta <*> tb) $ playNotes <$> testSong2Chords
+      summedSrc = mixAll $ playNotes <$> testSong2Chords
       sampSrc = asPCM summedSrc
       
   putSampleSource mvSampleSrc sampSrc

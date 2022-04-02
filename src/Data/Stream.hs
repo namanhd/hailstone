@@ -1,6 +1,6 @@
 module Data.Stream where 
 
-import Prelude hiding (splitAt, head, tail, zipWith, repeat)
+import Prelude hiding (splitAt, head, tail, zipWith, repeat, interleave)
 
 -- | Infinite list. 
 -- Definitions are selections from this module
@@ -31,19 +31,19 @@ splitAt n xs
             in  (head xs : prefix, rest)
   | otherwise = error "splitAt negative argument"
 
--- | Get the head of the stream
+-- | Get the head of the stream.
 head :: Stream a -> a 
 head (Cons x _) = x
 
--- | Get the stream but without its head
+-- | Get the stream but without its head.
 tail :: Stream a -> Stream a
 tail (Cons _ xs) = xs
 
--- | Combine two streams into one using a pointwise function
+-- | Combine two streams into one using a pointwise function.
 zipWith :: (a -> b -> c) -> Stream a -> Stream b -> Stream c
 zipWith f ~(Cons x xs) ~(Cons y ys) = Cons (f x y) (zipWith f xs ys)
 
--- | Build a stream that contains the same value repeated infinitely
+-- | Build a stream that contains the same value repeated infinitely.
 repeat :: a -> Stream a
 repeat x = Cons x (repeat x)
 
@@ -53,3 +53,7 @@ repeat x = Cons x (repeat x)
 fromInfList :: [a] -> Stream a
 fromInfList (x:xs) = Cons x (fromInfList xs)
 fromInfList [] = error "invalid to turn a finite list into a stream!"
+
+-- | Interleave two streams.
+interleave :: Stream a -> Stream a -> Stream a
+interleave ~(Cons a as) ~(Cons b bs) = (Cons a (Cons b (interleave as bs)))
