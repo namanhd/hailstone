@@ -114,7 +114,7 @@ constConvolve wndSize weights src = let window = fst $ STR.splitAt wndSize src i
 -- | Like `constConvolve` but the window size and conv weight lists are also
 -- streams.
 varConvolve :: (Num a) => Stream Int -> Stream [a] -> Stream a -> Stream a
-varConvolve (STR.Cons wndSize wnds) (STR.Cons weights wts) src@(STR.Cons _ xs) = 
+varConvolve ~(STR.Cons wndSize wnds) ~(STR.Cons weights wts) ~src@(STR.Cons _ xs) = 
   STR.Cons (sum $ zipWith (*) weights window) (varConvolve wnds wts xs)
   where
     window = fst $ STR.splitAt wndSize src
@@ -223,7 +223,7 @@ piecewise chanMode emptyVal startAt sourcesDurations timeSrc =
     -- source-and-time list is sorted in ascending start-time order, which the
     -- sourcesAbsoluteTime definition above should ensure.
     customMap [] _ = pure emptyVal -- we could continue to consume time here but uh
-    customMap curr@(((STR.Cons x xs), dur, start):rest) tsrce@(STR.Cons t ts) = 
+    customMap ~curr@((~(STR.Cons x xs), dur, start):rest) ~tsrce@(STR.Cons t ts) = 
       if (t < start) 
       then STR.Cons emptyVal (customMap curr ts) -- output empty/silence but still progress forward in time
       else if (t >= start) && (t < start + dur) -- we're in the time frame for this source...
