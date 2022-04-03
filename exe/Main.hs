@@ -13,7 +13,7 @@ testSong = let nop = Nothing in [
   Cell 660 0.25 0.5 nop, Cell 550 0.25 0.5 nop, Cell 440 0.25 1.0 nop]
 
 testSong2Chords :: [[Cell]]
-testSong2Chords = let dur = 1.4; vol = 0.1; panL = Just 0.2; panR = Just 0.8; panC = Just 0.5 in
+testSong2Chords = let dur = 1.0; vol = 0.2; panL = Just 0.2; panR = Just 0.8; panC = Just 0.5 in
   [
     [Cell (0.5 * 440) vol dur panL, Cell (0.5 * 440 * 4 / 3) vol dur panL, Cell (0.5 * 440 * 8/9) vol dur panL],
     [Cell (440 * 6/5) vol dur panR, Cell (220 * (4/3) * (5/4)) vol dur (Just 0.1), Cell (440 * (8/9) * (5/4)) vol dur panR],
@@ -64,7 +64,7 @@ applyLPfilter wndSize = constConvolve wndSize (windowWeights wndSize)
 
 tonetestmainSDL :: IO ()
 tonetestmainSDL = do
-  let sampleRate = 32000
+  let sampleRate = 40000
       bufferSize = 8192
       chanMode = Stereo
   putStrLn "Opening audio"
@@ -76,14 +76,14 @@ tonetestmainSDL = do
         retriggerWithNotes chanMode 0.0 0.0 ts testSynth1 notes
       summedSrc = mixAll $ playNotes <$> testSong2Chords
       -- add some delay!! here, set to 0.15 seconds of delay
-      delaySrc = piecewise Stereo 0 (0.15) [(summedSrc, 4.0)] ts
-      summedAndDelay = 0.75 *| summedSrc |+| (0.2) *| delaySrc
+      delaySrc = piecewise chanMode 0 (0.15) [(summedSrc, 10.0)] ts
+      summedAndDelay = 0.75 *| summedSrc |+| 0.25 *| delaySrc
       sampSrc = asPCM summedAndDelay
       
   putSampleSource mvSampleSrc sampSrc
   enableAudio audioDevice
   putStrLn "Starting play"
-  let runDuration = 5.0 :: TimeVal
+  let runDuration = 6.0 :: TimeVal
   threadDelay (round $ runDuration * 1000000)
 
   putStrLn "Done waiting"
