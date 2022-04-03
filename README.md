@@ -4,17 +4,18 @@ haskell audio synthesis + song composition embedded languages,
 roughly in the spirit of `haskore` and the klangfreude microtonal 
 tracker.
 
-(Made mostly for learning purposes (Haskell and DSP), so the synthesis math/design might be shaky.)
+(Made mostly for learning purposes (Haskell and DSP), so the synthesis
+math/design might be shaky; see [Issues and drawbacks](#issues-and-drawbacks))
 
 ## Synthesis
-hailstone's audio synthesis uses the `Stream`, often called "sources" in the
-code. A `Stream` is just an infinite lists of values whose values are calculated
-lazily on-demand, but these values can be *functions*, which is where it gets
-interesting. One can compose streams together such that parameters of a stream
-of functions can themselves come from streams; this way, modulation interactions
-between streams are obtained almost for free (in practice this is achieved
-simply with `ZipList`-like `Functor` and `Applicative` instances for streams;
-see `Data.Stream`)
+hailstone's audio synthesis revolves around `Stream`s, often called "sources" in
+the code. A `Stream` is just an infinite lists of values whose values are
+calculated lazily on-demand, but these values can be *functions*, which is where
+it gets interesting. One can compose streams together such that parameters of a
+stream of functions can themselves come from streams; this way, modulation
+interactions between streams are obtained almost for free (in practice this is
+achieved simply with `ZipList`-like `Functor` and `Applicative` instances for
+streams; see `Data.Stream`)
 
 For instance, one can define a sine source as follows:
 ```haskell
@@ -33,7 +34,7 @@ Then to modulate the frequency of another sine source using this
 modulatedSinSource = sineFn <$> pure 0.0 <*> sin440 <*> pure 1.0 <*> ts
 ```
 
-(`pure x` lifts an unboxed value `x` into a `Stream` that repeats `x` infinitely.)
+(`pure x` lifts an unboxed value `x` into a `Stream` that repeats `x`.)
 
 In practice the `Applicative` infix operator notation is fine for quick math
 operations on streams, but it might become a bit unwieldy for such a
@@ -60,7 +61,8 @@ play back in sequence, each with a given playback duration.
 
 For reference, `piecewise`'s type is
 ```haskell
-piecewise :: a  -- value to fill an empty stream when out of time
+piecewise :: ChanMode -- Mono or Stereo
+          -> a  -- value to fill an empty stream when out of time
           -> TimeVal -- start time offset
           -> [(Stream a, TimeVal)] -- streams and their durations
           -> Stream TimeVal -- the time stream to work from
@@ -69,18 +71,23 @@ piecewise :: a  -- value to fill an empty stream when out of time
 
 An expression like
 ```haskell
-piecewise 0 0 [(sin440, 1.0), (modulatedSinSource, 2.0)] ts
+piecewise Mono 0 0 [(sin440, 1.0), (modulatedSinSource, 2.0)] ts
 ```
 will create a stream that plays the 440Hz sine for `1.0` second, then the
-modulated sine wave (that we defined above) for `2.0` seconds, then silence (specified with `0`.) This is
-in effect how a melody line can be coerced into `Stream` form; this is done with
-the helper `notesToSource` which calls `piecewise` twice to create a stream for
-frequencies and a stream for volumes. 
+modulated sine wave (that we defined above) for `2.0` seconds, then silence
+(specified with `0`.) This is in effect how a melody line can be coerced into
+`Stream` form; this is done with the helper `notesToStreams` which calls
+`piecewise` three times to create a stream for frequencies, a stream for
+volumes, and a stream for panning values (because note cells may also store
+their own pan values.)
 
 Playing back this melody using a carrier waveform stream (an "instrument") is
 thus done by using this melody stream to modulate the frequency of the carrier
 stream; the melody stream can also be used to modulate other things that must be
-some function of the melody's frequencies. 
+some function of the melody's frequencies. Alternatively, `retriggerWithNotes`
+restarts the synth signal on every new note, creating a "keystroke/retrigger"
+effect, rather than letting the synth sound continue to evolve independently of
+the melody.
 
 On the other hand, since melody frequencies are also just streams, they
 themselves can also be modulated; this is how vibrato can be done (by adding a
@@ -105,6 +112,29 @@ In service of a free, unrestrictive, and unopinionated compositional paradigm,
 there are no predefined note names. Composing a melody line consists of
 stringing together consecutive intervals (which may be literal fractions/cent
 values and variables assigned to these)
+
+## Issues and drawbacks
+Real-time audio synthesis in Haskell has been attempted by many, and it does not
+appear to be a solved problem at all. While the infinite lazy list interface
+might be extremely idiomatic, expressive, and straightforward, it's also really
+slow and thus not truly adequate for real-time audio. (Having less than 10 sine
+sources in the test application already sometimes lags the audio even with large
+buffer sizes like `4096`.) 
+
+The best crack at this hard-realtime problem has probably been Henning
+Thielemann's (also developer of `haskore`) `synthesizer` package, and 
+[weighing many options and difficulties](https://wiki.haskell.org/Synthesizer), 
+that package ended up doing its audio streams by 
+[constructing LLVM code at runtime](https://haskell-cafe.haskell.narkive.com/MM57Tz5H/lazy-cons-stream-fusion-style); 
+a far cry from the raw elegance (i.e. low mental and keystroke load) of the lazy
+list approach.
+
+Since hailstone is a hobby learning project, I will probably not aim for
+industrial-strength audio performance, even if a more full-fledged GUI music
+editor evolves around this. The elegant synthesis paradigm using lazy lists
+(what I call the `Stream`) is too hard to give up, given that it is only a
+problem at realtime and not render-time, and given that for now most of the
+composing work done on this will be as an embedded DSL.
 
 ## Organization
 The library is in `src/`. The executable is in `exe/Main.hs`, which is
