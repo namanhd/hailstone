@@ -71,7 +71,7 @@ applyLPfilter wndSize = constConvolve wndSize (windowWeights wndSize)
 
 tonetestmainSDL :: IO ()
 tonetestmainSDL = do
-  let sampleRate = 38000
+  let sampleRate = 44100
       bufferSize = 8192
       chanMode = Stereo
   putStrLn "Opening audio"

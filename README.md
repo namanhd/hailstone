@@ -10,14 +10,11 @@ math/design might be shaky; see [Issues and drawbacks](#issues-and-drawbacks))
 ## Synthesis
 hailstone's audio synthesis revolves around `Stream`s, often called "sources" in
 the code. A `Stream` is just an infinite lists of values whose values are
-calculated lazily on-demand, but these values can be *functions*, which is where
-it gets interesting. One can compose streams together such that parameters of a
-stream of functions can themselves come from streams; this way, modulation
-interactions between streams are obtained almost for free (in practice this is
-achieved simply with `ZipList`-like `Functor` and `Applicative` instances for
-streams; see `Data.Stream`)
+calculated lazily on-demand. One can compose streams together and use them as
+streams of arguments for functions (e.g. oscillators); this way, modulation
+interactions between oscillators are obtained almost for free.
 
-For instance, one can define a sine source as follows:
+For instance, one can define a sine source as follows.
 ```haskell
 sineFn :: Double -> Freq -> Vol -> TimeVal -> Double
 sineFn phase freq vol t = vol * sin (2 * pi * freq * t)
@@ -37,25 +34,28 @@ modulatedSinSource = sineFn <$> pure 0.0 <*> sin440 <*> pure 1.0 <*> ts
 (`pure x` lifts an unboxed value `x` into a `Stream` that repeats `x`.)
 
 In practice the `Applicative` infix operator notation is fine for quick math
-operations on streams, but it might become a bit unwieldy for such a
-commonly-used source like sine waves, so `Hailstone.Synth` defines the following
-to quickly create a sine source from streams of parameters:
+operations on streams, but due to the way `(<*>)` is defined in terms of 2-ary
+`zipWith`, the intermediate streams of partially-applied functions can quickly
+build up and cause lots of allocations. This will result in general slowness and
+badness with math expressions using `(<*>)`. So, `sinSource` and similar
+functions are defined as the following to quickly and efficiently create a sine
+source from parameters:
 ```haskell
 sinSource :: Stream Double 
           -> Stream Freq 
           -> Stream Vol 
           -> Stream TimeVal 
           -> Stream Double
-sinSource phases fs vs ts = sineFn <$> phases <*> fs <*> vs <*> ts
+-- In spirit: sinSource phases fs vs ts = sineFn <$> phases <*> fs <*> vs <*> ts
+sinSource = zipWith4 sineFn
 ```
 The above would thus become
 ```haskell
 modulatedSinSource = sinSource (pure 0.0) sin440 (pure 1.0) ts
 ```
 
-Streams can be combined by zipping them together using a function applied
-pointwise (i.e. to corresponding values of each stream), as in the `Applicative`
-instance. However, more powerfully, they can also be spliced up and sequenced
+So, `Stream`s can be combined by zipping them together using a function applied
+pointwise. However, more powerfully, they can also be spliced up and sequenced
 `piecewise`; one can define a stream to be composed of different streams that
 play back in sequence, each with a given playback duration.
 
@@ -75,19 +75,20 @@ piecewise Mono 0 0 [(sin440, 1.0), (modulatedSinSource, 2.0)] ts
 ```
 will create a stream that plays the 440Hz sine for `1.0` second, then the
 modulated sine wave (that we defined above) for `2.0` seconds, then silence
-(specified with `0`.) This is in effect how a melody line can be coerced into
-`Stream` form; this is done with the helper `notesToStreams` which calls
-`piecewise` three times to create a stream for frequencies, a stream for
-volumes, and a stream for panning values (because note cells may also store
+(specified with the first `0` argument.) This is in effect how a melody line can
+be coerced into `Stream` form; this is done with the helper `notesToStreams`
+which calls `piecewise` three times to create a stream for frequencies, a stream
+for volumes, and a stream for panning values (because note cells may also store
 their own pan values.)
 
-Playing back this melody using a carrier waveform stream (an "instrument") is
-thus done by using this melody stream to modulate the frequency of the carrier
-stream; the melody stream can also be used to modulate other things that must be
-some function of the melody's frequencies. Alternatively, `retriggerWithNotes`
-restarts the synth signal on every new note, creating a "keystroke/retrigger"
-effect, rather than letting the synth sound continue to evolve independently of
-the melody.
+With `piecewise`, we can "play back" a melody using a carrier waveform stream
+(an "instrument") by using this melody stream to modulate the frequency of the
+carrier stream. The melody stream can also be used to modulate other things that
+must be some function of the melody's frequencies.
+
+Alternatively, `retriggerWithNotes` restarts the synth signal on every new note,
+creating a "keystroke/retrigger" effect, rather than letting the synth sound
+continue to evolve independently of the melody.
 
 On the other hand, since melody frequencies are also just streams, they
 themselves can also be modulated; this is how vibrato can be done (by adding a
@@ -132,9 +133,9 @@ list approach.
 Since hailstone is a hobby learning project, I will probably not aim for
 industrial-strength audio performance, even if a more full-fledged GUI music
 editor evolves around this. The elegant synthesis paradigm using lazy lists
-(what I call the `Stream`) is too hard to give up, given that it is only a
-problem at realtime and not render-time, and given that for now most of the
-composing work done on this will be as an embedded DSL.
+(what I call the `Stream`) is too hard to give up (at least, at the moment),
+given that it is only a problem at realtime and not render-time, and given that
+for now most of the composing work done on this will be as an embedded DSL.
 
 ## Organization
 The library is in `src/`. The executable is in `exe/Main.hs`, which is
