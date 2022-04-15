@@ -17,7 +17,7 @@ import qualified SDL as SDL
 import Data.Word (Word16) -- for buffer size
 import qualified Data.Vector.Storable.Mutable as SMV
 
-import Sound.Hailstone.SynthR
+import Sound.Hailstone.Synth
 
 data SignalState = 
   SigState { getSampleSource :: SampleSource

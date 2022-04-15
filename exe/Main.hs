@@ -2,7 +2,7 @@
 
 module Main where
 
-import Sound.Hailstone.SynthR
+import Sound.Hailstone.Synth
 import Sound.Hailstone.SDLAudio
 import Control.Concurrent (threadDelay)
 

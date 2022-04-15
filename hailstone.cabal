@@ -17,7 +17,7 @@ library
   hs-source-dirs:    src
   ghc-options:       -Wall -O3 -threaded
   default-language:  Haskell2010
-  exposed-modules:   Sound.Hailstone.SynthR
+  exposed-modules:   Sound.Hailstone.Synth
                    , Sound.Hailstone.Types
                    , Sound.Hailstone.SDLAudio
   build-depends:     base >= 4.7 && < 5
