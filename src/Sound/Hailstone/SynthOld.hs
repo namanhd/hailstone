@@ -1,4 +1,4 @@
-module Sound.Hailstone.Synth 
+module Sound.Hailstone.SynthOld 
 ( -- * Type synonyms and datatypes
   -- ** Re-exports from "Sound.Hailstone.Types".
   SynthVal, Freq, Vol, Pan, SampleRate, TimeVal, SampleVal
