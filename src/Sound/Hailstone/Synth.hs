@@ -21,6 +21,9 @@ module Sound.Hailstone.Synth
   -- ** Sequencing streams
 , piecewise
 , retriggerWithNotes
+  -- ** Envelopes
+, ADSRParams(..)
+, linearRamp, adsrEnvelope
 )
 where
 
@@ -33,8 +36,9 @@ import Sound.Hailstone.Types
 -- and the current channel (L/R/Mono).
 type Signal = Reader (TimeVal, TimeVal, CurrChan)
 
+-- | To handle stereo signals
 data CurrChan = CMono | CLeft | CRight
-  deriving (Eq, Show)
+  deriving (Eq)
 
 -- | A signal function will need access to the current time tick, as well as the
 -- time-delta between ticks (i.e. 1 / (sample-rate)), as well as the channel
@@ -88,6 +92,9 @@ varConvolve windowSig weightSig sig = do
     runSignal sig <$> [(t + d*i, d, c) | i <- [0..fromIntegral wndSize]]
 
 -- | Convenience wrapper for constConvolve for common LP filtering.
+-- TODO this implementation using convolve is RIDICULOUSLY slow because it
+-- is not memoized (unlike lazy lists where memoization is builtin to the 
+-- haskell runtime). I should try to come up with something faster.
 filterLP :: (Num a, Fractional a) => Int -> Signal a -> Signal a
 filterLP wndSize = constConvolve wndSize (windowWeights wndSize)
   where 
@@ -97,7 +104,7 @@ filterLP wndSize = constConvolve wndSize (windowWeights wndSize)
 
 -- | Mix two signals with addition.
 mix :: (Num a) => Signal a -> Signal a -> Signal a
-mix = liftM2 (+) -- ok <*> might be slow.. but do we even have a better solution
+mix = liftM2 (+)
 
 -- | Infix version of `mix`.
 (|+|) :: (Num a) => Signal a -> Signal a -> Signal a
@@ -194,9 +201,6 @@ cascadeMap baseAccumVal accumFn decorateFn (a:as) =
 piecewise :: a -> [(Signal a, TimeVal)] -> Signal a
 piecewise emptyVal sourcesDurations = getTime >>= customMap sourcesAbsoluteTimes
   where
-    -- timeSrcAtChanMode = case chanMode of
-    --   Mono -> timeSrc
-    --   Stereo -> interleave timeSrc timeSrc
     sourcesAbsoluteTimes = fst $ cascadeMap (0.0 :: TimeVal)
       (\acc (_  , dur) -> acc + dur) 
       (\acc (src, dur) -> (src, dur, acc)) 
@@ -244,10 +248,44 @@ retriggerWithNotes  :: SynthVal -- ^empty value for when notes have concluded
                     -> Signal SynthVal
 retriggerWithNotes emptyVal sfunc cells = 
   piecewise emptyVal 
-    ((\cell -> (doPanning (panOf cell) $ sfunc (pure $ freqOf cell) (pure $ volOf cell)
-      , durOf cell )) <$> cells)
+    ((\cell -> ( (adsrEnvelope (adsrOf cell) |*|) . doPanning (panOf cell) $ 
+      sfunc (pure $ freqOf cell) (pure $ volOf cell), durOf cell )) <$> cells)
   where
     doPanning maybePan = constStereoize $ unmaybePan maybePan
+
+-- stuff for envelopes
+
+-- | A linear ramp signal that increases from start to end (or optionally 
+-- decreases) in a given duration, then holds
+linearRamp :: TimeVal -> SynthVal -> SynthVal -> Signal SynthVal
+linearRamp dur start end = if dur == 0 then pure end else getTime >>= \t -> pure $
+  let up = max smaller . min bigger $ smaller + (bigger - smaller) * (t / dur)
+  in if downramp then smaller + bigger - up else up
+  where
+    downramp = start > end
+    smaller = min start end
+    bigger = max start end
+
+-- | Create a signal that traverses an ADSR envelope according to some given
+-- envelope parameters.
+adsrEnvelope :: ADSRParams -> Signal SynthVal
+adsrEnvelope adsrVals = piecewise 0.0 
+  [ (attackSig, at), (decaySig, dt), (pure susLvl, st), (releaseSig, rt) ]
+  where
+    at = attackTimeOf adsrVals
+    dt = decayTimeOf adsrVals
+    rt = releaseTimeOf adsrVals
+    totalt = totalTimeOf adsrVals
+    st = totalt - at - dt - rt 
+    -- note that ^ totalt doesn't have to match the note's playback time.
+    -- you could set the Cell (note)'s duration to be really long while
+    -- the envelope-totalt very short to traverse the envelope very quickly,
+    -- followed by some quiet before the next note; i.e. staccato.
+    susLvl = sustainLvlOf adsrVals
+    attackSig = linearRamp at (startLvlOf adsrVals) 1.0 -- ramp up
+    decaySig = linearRamp dt 1.0 susLvl -- ramp down
+    releaseSig = linearRamp rt susLvl (endLvlOf adsrVals) -- ramp down
+
 
 
 -- | Actually run and sample from the signal at some time, delta, and channel.
