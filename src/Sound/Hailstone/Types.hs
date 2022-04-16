@@ -60,6 +60,13 @@ data Cell = Cell
   }
   deriving (Show, Eq)
 
+-- TODO : EPIC IDEA! Have a generalized Cell that has signals for all of these
+-- things. Signal frequency, Signal vol, etc etc. That way....
+-- we can embed entire VOICES, and PATTERNS, into Cells! So we get a playlist
+-- view/pattern sequencing mechanism, for free!!
+
+
+
 -- | Attack-decay-sustain-release envelope parameters. Values of type `SynthVal`
 -- are between 0 and 1.
 data ADSRParams = 

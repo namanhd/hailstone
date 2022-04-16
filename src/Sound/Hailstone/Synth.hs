@@ -9,7 +9,7 @@ module Sound.Hailstone.Synth
 , SampleSource
 , CurrChan(..)
   -- * Functions
-  -- ** For processing a stream at the audio backend level
+  -- ** For processing a signal at the audio backend level
 , sampleSignalAt
 , asPCM
   -- ** Creating signals
@@ -18,7 +18,7 @@ module Sound.Hailstone.Synth
 , clip, mix, mixAll, (|+|), (|*|), scale, (*|)
 , constConvolve, varConvolve, filterLP
 , interleave, constStereoize, varStereoize, delay, modifyTime
-  -- ** Sequencing streams
+  -- ** Sequencing signals
 , piecewise
 , retriggerWithNotes
   -- ** Envelopes
@@ -32,24 +32,23 @@ where
 import Control.Monad.Reader
 import Sound.Hailstone.Types
 
--- | The output of a signal depends on the current time, the sampling delta,
--- and the current channel (L/R/Mono).
+-- | A signal function will need access to the current time tick, as well as the
+-- time-delta between ticks (i.e. 1 / (sample-rate)), as well as the channel
+-- being played-on (for interleaving). 
 type Signal = Reader (TimeVal, TimeVal, CurrChan)
 
 -- | To handle stereo signals
 data CurrChan = CMono | CLeft | CRight
   deriving (Eq)
 
--- | A signal function will need access to the current time tick, as well as the
--- time-delta between ticks (i.e. 1 / (sample-rate)), as well as the channel
--- being played-on (for interleaving). 
+-- | The final output signal to send to the audio backend.
 type SampleSource = Signal SampleVal
 
--- | Retrieve the time tick and time delta context from the Reader monad
+-- | Retrieve the time tick context from the Reader monad.
 getTime :: Signal TimeVal
-getTime = ask >>= \(t,_, _) -> pure t
+getTime = reader (\(t, _, _) -> t)
 
--- | Synonym of `runReader` for readability
+-- | Synonym of `runReader` for readability.
 runSignal :: Signal a -> (TimeVal, TimeVal, CurrChan) -> a
 runSignal = runReader
 
@@ -101,7 +100,6 @@ filterLP wndSize = constConvolve wndSize (windowWeights wndSize)
     windowWeights windowSize = fmap (* (1/fromIntegral windowSize)) 
       . take windowSize $ repeat 1
 
-
 -- | Mix two signals with addition.
 mix :: (Num a) => Signal a -> Signal a -> Signal a
 mix = liftM2 (+)
@@ -133,18 +131,19 @@ delay :: a -> TimeVal -> Signal a -> Signal a
 delay emptyVal dur sig = getTime >>= \t -> if t < dur then pure emptyVal else 
   modifyTime (subtract dur) sig
 
--- | Mix a list of streams.
+-- | Mix a list of signals.
 mixAll :: (Num a) => [Signal a] -> Signal a
 mixAll = foldl1 mix
 
--- | Convert a double-generating source (such as a raw waveform stream) into a
--- stream of audio sample values in our audio setup (here, @Int16@), with
--- scaling up to sample values followed by rounding and clipping
+-- | Convert a double-generating signal (such as a raw waveform) into a signal
+-- of audio sample values in our audio setup (here, @Int16@), with scaling up to
+-- sample values followed by rounding and clipping
 asPCM :: Signal SynthVal -> SampleSource
 asPCM = clip . fmap round . scale (fromIntegral (maxBound :: SampleVal))
 
--- | Interleave a stream with itself and apply some panning to turn a mono
--- stream into a stereo stream. Note that pan values are from 0. to 1., where
+-- | Interleave a signal with itself and apply some panning to turn a mono
+-- signal into a stereo signal. May also be used to modify the panning of an
+-- existing stereo signal. Note that pan values are from 0. to 1., where
 -- 0.0 is hard left, 0.5 is centered, and 1.0 is hard right. (Though, no
 -- bounds checking is done to ensure this.)
 constStereoize :: (Num a) => a -> Signal a -> Signal a
@@ -156,23 +155,20 @@ varStereoize :: (Num a) => Signal a -> Signal a -> Signal a
 varStereoize panSig src = 
   panSig >>= \pan -> interleave (scale (1 - pan) src) (scale pan src)
 
--- | Generic waveform source (a waveform function that can be used is any
+-- | Generic waveform signal (a waveform function that can be used is any
 -- @(SynthVal -> SynthVal)@ function with domain [0, inf) and range [-1, 1]).
 waveformSource :: (SynthVal -> SynthVal) -> Signal Freq -> Signal Vol -> Signal SynthVal
-waveformSource waveFn fs vs = 
-  getTime >>= \t -> liftM2 (\f v -> v * waveFn (f * t)) fs vs
+waveformSource waveFn = liftM3 (\t f v -> v * waveFn (f * t)) getTime
 
--- | Sinusoidal waveform source
+-- | Sinusoidal waveform signal
 sinSource :: Signal SynthVal -> Signal Freq -> Signal Vol -> Signal SynthVal
-sinSource ps fs vs = 
-  getTime >>= \t -> liftM3 (\p f v -> v * sin (2 * pi * f * t + p)) ps fs vs
-  
+sinSource = liftM4 (\t p f v -> v * sin (2 * pi * f * t + p)) getTime
 
--- | Square waveform source; supports modulation of frequency, volume, and time
+-- | Square waveform signal; supports modulation of frequency, volume, and time
 -- scale. (Duty cycle might become a parameter later down the line)
 squareSource :: Signal Freq -> Signal Vol -> Signal SynthVal
-squareSource fs vs = getTime >>= \t -> liftM2 (\f v -> let ft = f * t in
-  v * fromIntegral ((2 * (2 * floor ft - floor (2 * ft)) + 1) :: Int)) fs vs
+squareSource = liftM3 (\t f v -> let ft = f * t in v * fromIntegral 
+  ((2 * (2 * floor ft - floor (2 * ft)) + 1) :: Int)) getTime
 
 
 -- | Funny @fold@/@mapAccum@-ish helper for `piecewise`, but may be useful
@@ -194,32 +190,34 @@ cascadeMap baseAccumVal accumFn decorateFn (a:as) =
   in  ((decorateFn baseAccumVal a):rList, rAccum)
 
 
--- | Splice together segments from different sources depending on the duration
--- they should play for. The input should be a list of @[(source, duration)]@
--- for each source that plays for each duration, sequenced together in the order
+-- | Splice together segments from different signals depending on the duration
+-- they should play for. The input should be a list of @[(signal, duration)]@
+-- for each signal that plays for each duration, sequenced together in the order
 -- they're in in the list. 
 piecewise :: a -> [(Signal a, TimeVal)] -> Signal a
-piecewise emptyVal sourcesDurations = getTime >>= customMap sourcesAbsoluteTimes
+piecewise emptyVal sigsDurations = getTime >>= customMap sigsAbsoluteTimes
   where
-    sourcesAbsoluteTimes = fst $ cascadeMap (0.0 :: TimeVal)
+    sigsAbsoluteTimes = fst $ cascadeMap (0.0 :: TimeVal)
       (\acc (_  , dur) -> acc + dur) 
       (\acc (src, dur) -> (src, dur, acc)) 
-      sourcesDurations
+      sigsDurations
 
-    -- Essentially, take from the current source if the current time step covers
-    -- its time frame. If the time frame is out, try moving onto the next source
+    -- Essentially, take from the current signal if the current time step covers
+    -- its time frame. If the time frame is out, try moving onto the next signal
     -- and see if we can consume that one. If time has run out for all the
-    -- component sources, we just return a zero-stream. This assumes that the
-    -- source-and-time list is sorted in ascending start-time order, which the
-    -- sourcesAbsoluteTime definition above should ensure.
+    -- component signals, we just return a zero-signal. This assumes that the
+    -- signal-and-time list is sorted in ascending start-time order, which the
+    -- sigsAbsoluteTime definition above should ensure.
     customMap [] _ = pure emptyVal -- we could continue to consume time here but uh
     customMap ((sig, dur, start):rest) t
       | (t < start) = pure emptyVal
       | (t >= start) && (t < start + dur) = modifyTime (subtract start) sig
+        -- TODO add option to disable this modifyTime to allow the signal to
+        -- use the current time rather than starting from t=0 from its POV
       | otherwise = customMap rest t
 
 {-
--- | Convenience wrapper over `piecewise` to compose a source that plays out the
+-- | Convenience wrapper over `piecewise` to compose a signal that plays out the
 -- sequence of frequencies + volumes according to some note data (as `Cell`s)
 notesToSignals :: TimeVal -- ^start offset time of the melody line
                -> [Cell] -- ^note data cells making up the melody
@@ -239,11 +237,11 @@ notesToSignals startAt cells = (fs, vs, ps)
 -- | This is what is understood as "playing a melody with a synth". Effectively
 -- "resets and retriggers" a signal in sync with note data. This will work on
 -- any signal that is parameterized by a frequency and volume (i.e. a synth
--- source); in addition, panning will be applied if stereo output is desired.
+-- signal); in addition, panning will be applied if stereo output is desired.
 retriggerWithNotes  :: SynthVal -- ^empty value for when notes have concluded
                     -> (Signal Freq -> Signal Vol -> Signal SynthVal) 
-                        -- ^stream to retrigger in sync with notes, parameterized
-                        -- by frequency, volume, and timestep 
+                        -- ^signal to retrigger in sync with notes,
+                        -- parameterized by frequency, volume, and timestep 
                     -> [Cell] -- ^note data cells making up the melody
                     -> Signal SynthVal
 retriggerWithNotes emptyVal sfunc cells = 
@@ -253,18 +251,16 @@ retriggerWithNotes emptyVal sfunc cells =
   where
     doPanning maybePan = constStereoize $ unmaybePan maybePan
 
+
 -- stuff for envelopes
 
 -- | A linear ramp signal that increases from start to end (or optionally 
 -- decreases) in a given duration, then holds
 linearRamp :: TimeVal -> SynthVal -> SynthVal -> Signal SynthVal
 linearRamp dur start end = if dur == 0 then pure end else getTime >>= \t -> pure $
-  let up = max smaller . min bigger $ smaller + (bigger - smaller) * (t / dur)
+  let downramp = start > end; smaller = min start end; bigger = max start end;
+      up = max smaller . min bigger $ smaller + (bigger - smaller) * (t / dur)
   in if downramp then smaller + bigger - up else up
-  where
-    downramp = start > end
-    smaller = min start end
-    bigger = max start end
 
 -- | Create a signal that traverses an ADSR envelope according to some given
 -- envelope parameters.
@@ -285,7 +281,6 @@ adsrEnvelope adsrVals = piecewise 0.0
     attackSig = linearRamp at (startLvlOf adsrVals) 1.0 -- ramp up
     decaySig = linearRamp dt 1.0 susLvl -- ramp down
     releaseSig = linearRamp rt susLvl (endLvlOf adsrVals) -- ramp down
-
 
 
 -- | Actually run and sample from the signal at some time, delta, and channel.

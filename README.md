@@ -8,105 +8,72 @@ tracker.
 math/design might be shaky; see [Issues and drawbacks](#issues-and-drawbacks))
 
 ## Synthesis
-hailstone's audio synthesis revolves around `Stream`s, often called "sources" in
-the code. A `Stream` is just an infinite lists of values whose values are
-calculated lazily on-demand. One can compose streams together and use them as
-streams of arguments for functions (e.g. oscillators); this way, modulation
-interactions between oscillators are obtained almost for free.
-
-For instance, one can define a sine source as follows.
+A signal is a function that depends on the current time (or for digital audio
+which is discretized: time, sample rate (in practice, `1/sampleRate` which gives
+the delta time between sampling time ticks), and the current stereo channel).
+This can be described with the type
 ```haskell
-sineFn :: Double -> Freq -> Vol -> TimeVal -> Double
-sineFn phase freq vol t = vol * sin (2 * pi * freq * t)
+type Signal a = (TimeVal, TimeVal, CurrChan) -> a
+```
+but this is just the same type as the `Reader` monad, where the reader context
+is of type `(TimeVal, TimeVal, CurrChan)`, so we can just say
+```haskell
+type Signal = Reader (TimeVal, TimeVal, CurrChan)
+```
+and we get the niceties of the reader monad for free.
 
-ts = timesteps sampleRate --create a stream of TimeVal sampled at sampleRate
+This means defining signal functions looks like this (where `getTime :: Signal
+TimeVal` is a monadic action that extracts the current time from the
+reader context):
+```haskell
+-- sin waveform function
+sinewave :: TimeVal -> SynthVal -> Freq -> Vol -> SynthVal
+sinewave t phase freq vol = vol * sin (2 * pi * freq * t)
 
--- A constant sinusoidal at 0 phase shift, frequency 440, volume 1.0:
-sin440 = sineFn <$> pure 0.0 <*> pure 440.0 <*> pure 1.0 <*> ts
+-- A constant sinusoidal signal at 0 phase shift, frequency 440, volume 1.0:
+sin440 :: Signal SynthVal
+sin440 = sinewave <$> getTime <*> pure 0.0 <*> pure 440.0 <*> pure 1.0
 ```
 
 Then to modulate the frequency of another sine source using this
 `sin440` stream:
 ```haskell
-modulatedSinSource = sineFn <$> pure 0.0 <*> sin440 <*> pure 1.0 <*> ts
+modulatedSinSource = sinewave <$> getTime <*> pure 0.0 <*> sin440 <*> pure 1.0
 ```
 
-(`pure x` lifts an unboxed value `x` into a `Stream` that repeats `x`.)
-
-In practice the `Applicative` infix operator notation is fine for quick math
-operations on streams, but due to the way `(<*>)` is defined in terms of 2-ary
-`zipWith`, the intermediate streams of partially-applied functions can quickly
-build up and cause lots of allocations. This will result in general slowness and
-badness with math expressions using `(<*>)`. So, `sinSource` and similar
-functions are defined as the following to quickly and efficiently create a sine
-source from parameters:
-```haskell
-sinSource :: Stream Double 
-          -> Stream Freq 
-          -> Stream Vol 
-          -> Stream TimeVal 
-          -> Stream Double
--- In spirit: sinSource phases fs vs ts = sineFn <$> phases <*> fs <*> vs <*> ts
-sinSource = zipWith4 sineFn
-```
-The above would thus become
-```haskell
-modulatedSinSource = sinSource (pure 0.0) sin440 (pure 1.0) ts
-```
-
-So, `Stream`s can be combined by zipping them together using a function applied
-pointwise. However, more powerfully, they can also be spliced up and sequenced
-`piecewise`; one can define a stream to be composed of different streams that
-play back in sequence, each with a given playback duration.
+Signals can also be sequenced `piecewise`; one can define a signal to be
+composed of different signals that play back in sequence, each with a given
+playback duration.
 
 For reference, `piecewise`'s type is
 ```haskell
-piecewise :: ChanMode -- Mono or Stereo
-          -> a  -- value to fill an empty stream when out of time
-          -> TimeVal -- start time offset
-          -> [(Stream a, TimeVal)] -- streams and their durations
-          -> Stream TimeVal -- the time stream to work from
-          -> Stream a
+piecewise :: a -> [(Signal a, TimeVal)] -> Signal a
 ```
-
 An expression like
 ```haskell
-piecewise Mono 0 0 [(sin440, 1.0), (modulatedSinSource, 2.0)] ts
+piecewise 0.0 [(sin440, 1.0), (modulatedSinSource, 2.0)]
 ```
-will create a stream that plays the 440Hz sine for `1.0` second, then the
-modulated sine wave (that we defined above) for `2.0` seconds, then silence
-(specified with the first `0` argument.) This is in effect how a melody line can
-be coerced into `Stream` form; this is done with the helper `notesToStreams`
-which calls `piecewise` three times to create a stream for frequencies, a stream
-for volumes, and a stream for panning values (because note cells may also store
-their own pan values.)
+will create a signal that plays the 440Hz sine for `1.0` second, then the
+modulated sine wave (defined above) for `2.0` seconds, then silence
+(the value specified with the first (`0.0`) argument.)
 
-With `piecewise`, we can "play back" a melody using a carrier waveform stream
-(an "instrument") by using this melody stream to modulate the frequency of the
-carrier stream. The melody stream can also be used to modulate other things that
-must be some function of the melody's frequencies.
+With `piecewise`, we can then define some very useful audio/synthesis features:
 
-Alternatively, `retriggerWithNotes` restarts the synth signal on every new note,
-creating a "keystroke/retrigger" effect, rather than letting the synth sound
-continue to evolve independently of the melody.
-
-On the other hand, since melody frequencies are also just streams, they
-themselves can also be modulated; this is how vibrato can be done (by adding a
-sine stream onto the melody frequency stream). In the same spirit, since melody
-volumes are also just streams, they can be modulated piecewise; this is how ADSR
-and instrument envelopes can be done.
-
-As seen above, composed stream functions take in a timestep stream, effectively
-a quantized/sampled stream of time tick values of type `TimeVal`. This "samples"
-the stream at the appropriate sample rate to be consumed by the audio backend
-(which for now/for testing purposes is SDL audio, though the stream model should
-be general enough to adapt to any buffer-consuming audio API).
+- `retriggerWithNotes` restarts the synth signal on every new note, effectively
+allowing one to "play a melody using a synth/instrument" by creating a keystroke
+effect that retriggers and modulates the synth signal on every new note rather
+than letting the synth sound evolve independently of the notes.
+- `adsrEnvelope` together with `linearRamp` creates a signal that traverses an
+Attack - Decay - Sustain - Release (ADSR) envelope, which can then be multiplied
+by individual note-playing signals (for per-note ADSR), or entire summed signals
+(for envelope-based modulation of volume, panning, even synthesis parameters
+across playback).
 
 ## Composition
 
 TODO not finished yet...
 
-The composition language produces the note data to then convert into `Stream`
+The composition language produces the note data to then convert into `Signal`
 form.
 
 In service of a free, unrestrictive, and unopinionated compositional paradigm,
@@ -115,27 +82,37 @@ stringing together consecutive intervals (which may be literal fractions/cent
 values and variables assigned to these)
 
 ## Issues and drawbacks
-Real-time audio synthesis in Haskell has been attempted by many, and it does not
-appear to be a solved problem at all. While the infinite lazy list interface
-might be extremely idiomatic, expressive, and straightforward, it's also really
-slow and thus not truly adequate for real-time audio. (Having less than 10 sine
-sources in the test application already sometimes lags the audio even with large
-buffer sizes like `4096`.) 
+The original signal model in Hailstone was based on lazy infinite lists, which
+are extremely idiomatic in Haskell and pleasant to program with. However, this
+came with the huge drawback of having too many list-node allocations, consuming
+large amounts of memory and CPU time, and yielding overall terrible performance
+(the audio lags with just a few oscillators in 5 voices in even a high buffer
+size like 8192.) (See the code for this in `SynthOld.hs`)
 
-The best crack at this hard-realtime problem has probably been Henning
-Thielemann's (also developer of `haskore`) `synthesizer` package, and 
-[weighing many options and difficulties](https://wiki.haskell.org/Synthesizer), 
-that package ended up doing its audio streams by 
-[constructing LLVM code at runtime](https://haskell-cafe.haskell.narkive.com/MM57Tz5H/lazy-cons-stream-fusion-style); 
-a far cry from the raw elegance (i.e. low mental and keystroke load) of the lazy
-list approach.
+The current approach uses the reader monad, which means building up signals
+effectively boils down to a composition of time-dependent functions awaiting the
+application of the `(time, delta, channel)` reader context argument, which is
+only applied at the very end when the buffer needs to be written to. This is
+great: there are almost no allocations involved other than the index list at the
+very end for the buffer-writing, and is a lot faster, yielding smooth audio at
+44100Hz sample rate and a buffer size of 2048 (and maybe even 1024).
 
-Since hailstone is a hobby learning project, I will probably not aim for
-industrial-strength audio performance, even if a more full-fledged GUI music
-editor evolves around this. The elegant synthesis paradigm using lazy lists
-(what I call the `Stream`) is too hard to give up (at least, at the moment),
-given that it is only a problem at realtime and not render-time, and given that
-for now most of the composing work done on this will be as an embedded DSL.
+However, the one thing that the lazy list approach had that this doesn't is that
+once computed, list nodes (i.e. generated samples) are automatically memoized by
+the runtime. This allows the convolution functions (which require
+computation of the signal at time values in advance of the current time) to
+incur only a negligible performance hit with the lazy list representation since
+subsequent values can just be retrieved from the memoization. In contrast, in
+the reader monad approach, this kind of naive convolution results in massive
+performance loss and unworkable audio, since there is no memoization and the
+signal is effectively recalculated `n` times where `n` is the convolution window
+size.
+
+A good next task is thus to write some sort of FFT to turn this `O(n^2)`
+convolution into an `O(nlogn)` frequency-domain multiplication (which I'll need
+to look more into), as well as parallelization approaches to fill the buffer
+in a more efficient way.
+
 
 ## Organization
 The library is in `src/`. The executable is in `exe/Main.hs`, which is

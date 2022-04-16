@@ -31,9 +31,9 @@ testSong3 =
   , ($ myAdsr) <$> voice4
   ]
   where
-    { dur = 0.5; vol = 0.2; panL = Just 0.2; panR = Just 0.8; panC = Just 0.5; oct=2.0;
+    { dur = 1.0; vol = 0.2; panL = Just 0.2; panR = Just 0.8; panC = Just 0.5; oct=2.0;
       min3 = 6/5; maj3 = 5/4; p4 = 4/3; p5 = 3/2; maj2 = 9/8; min2 = 16/15; al=330.0; 
-      myAdsr = ADSR 0.0 0.02 0.05 0.9 0.02 0.0 (dur / 4);
+      myAdsr = ADSR 0.0 0.02 0.05 0.9 0.02 0.0 (dur / 2);
     voice1 = [n al vol dur panC, n (al/min3) vol dur panC, n (al*maj2) vol dur panC, n (al*maj2/oct) vol dur panC, 
      n (al/p4) vol dur panC, n (al*maj2/oct) vol dur panC, n (al/p4/oct) vol dur panC];
     voice2 = [n (al*maj3) vol dur panL, n (al) vol dur panL, n (al*maj2*maj3) vol dur panL, n (al*maj2/oct*(7/4)) vol dur panL, 
@@ -48,7 +48,7 @@ testSynth1 fs vs = finalSrc
   where
     sinModulatorSub1 = sinSource (pure 0.0) fs (pure 1.0)
     sinModulator = sinSource sinModulatorSub1 (2 *| fs) (pure 1.0)
-    fsWithVibrato = fs |+| sinSource (pure 0.0) (pure 1.1) (sinSource (pure (-0.1)) (pure 0.1) (pure 0.5))
+    fsWithVibrato = fs |+| sinSource (pure 0.0) (pure 2.0) (linearRamp 0.7 0.0 0.3)
     sinCarrier = sinSource sinModulator fsWithVibrato vs
     sinCarrierOvertone = sinSource sinModulator (2 *| fs) (0.3 *| vs)
     finalSrc = sinCarrier |+| sinCarrierOvertone
@@ -58,7 +58,7 @@ testSynth1 fs vs = finalSrc
 tonetestmainSDL :: IO ()
 tonetestmainSDL = do
   let sampleRate = 44100
-      bufferSize = 4096
+      bufferSize = 2048
       chanMode = Stereo
   putStrLn "Opening audio"
   (audioDevice, mSigState) <- openAudio sampleRate bufferSize chanMode
