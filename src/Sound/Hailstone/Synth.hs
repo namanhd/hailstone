@@ -35,6 +35,11 @@ import Sound.Hailstone.Types
 -- | A signal function will need access to the current time tick, as well as the
 -- time-delta between ticks (i.e. 1 / (sample-rate)), as well as the channel
 -- being played-on (for interleaving). 
+
+-- TODO type OscStates = some sort of vector that stores a set number of
+-- oscillator/effect states for smooth pitch shifting, as well as filter states,
+-- etc
+
 type Signal = Reader (TimeVal, TimeVal, CurrChan)
 
 -- | To handle stereo signals
@@ -75,9 +80,8 @@ infixr 5 *|
 -- (and constConvolve is already convoluted enough (hah)) so I've separated the
 -- two functions.
 constConvolve :: (Num a) => Int -> [a] -> Signal a -> Signal a
-constConvolve wndSize weights sig = ask >>= \(t, d, c) ->
-  pure . sum . zipWith (*) weights $ 
-    runSignal sig <$> [(t + d * i, d, c) | i <- [0..fromIntegral wndSize]]
+constConvolve wndSize weights sig = ask >>= \(_, d, _) -> 
+  mixAll $ zipWith (*|) weights [modifyTime (subtract (d * i)) sig | i <- [0..fromIntegral wndSize]]
 
 
 -- | Like `constConvolve` but the window size and conv weight lists are also
@@ -95,10 +99,8 @@ varConvolve windowSig weightSig sig = do
 -- is not memoized (unlike lazy lists where memoization is builtin to the 
 -- haskell runtime). I should try to come up with something faster.
 filterLP :: (Num a, Fractional a) => Int -> Signal a -> Signal a
-filterLP wndSize = constConvolve wndSize (windowWeights wndSize)
-  where 
-    windowWeights windowSize = fmap (* (1/fromIntegral windowSize)) 
-      . take windowSize $ repeat 1
+filterLP wndSize sig = let wt = 1/fromIntegral wndSize in wt `seq` ask >>= \(_,d,_) -> 
+  (wt *|) . mixAll . map (\i -> modifyTime (+ d*i) sig) $ [0..fromIntegral (wndSize-1)] 
 
 -- | Mix two signals with addition.
 mix :: (Num a) => Signal a -> Signal a -> Signal a

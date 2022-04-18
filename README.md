@@ -1,17 +1,16 @@
 # hailstone
 
-haskell audio synthesis + song composition embedded languages, 
-roughly in the spirit of `haskore` and the klangfreude microtonal 
-tracker.
+haskell audio synthesis + song composition embedded languages
 
 (Made mostly for learning purposes (Haskell and DSP), so the synthesis
-math/design might be shaky; see [Issues and drawbacks](#issues-and-drawbacks))
+math/design are decidedly janky; see [Issues and
+drawbacks](#issues-and-drawbacks))
 
 ## Synthesis
-A signal is a function that depends on the current time (or for digital audio
-which is discretized: time, sample rate (in practice, `1/sampleRate` which gives
-the delta time between sampling time ticks), and the current stereo channel).
-This can be described with the type
+At the moment a signal is modeled simply as a function that depends on the
+current time (or for digital audio which is discretized: time, sample rate (in
+practice, `1/sampleRate` which gives the delta time between sampling time
+ticks), and the current stereo channel). This can be described with the type
 ```haskell
 type Signal a = (TimeVal, TimeVal, CurrChan) -> a
 ```
@@ -57,7 +56,7 @@ will create a signal that plays the 440Hz sine for `1.0` second, then the
 modulated sine wave (defined above) for `2.0` seconds, then silence
 (the value specified with the first (`0.0`) argument.)
 
-With `piecewise`, we can then define some very useful audio/synthesis features:
+With `piecewise`, we can then define some nice audio/synthesis features:
 
 - `retriggerWithNotes` restarts the synth signal on every new note, effectively
 allowing one to "play a melody using a synth/instrument" by creating a keystroke
@@ -83,7 +82,7 @@ values and variables assigned to these)
 
 ## Issues and drawbacks
 The original signal model in Hailstone was based on lazy infinite lists, which
-are extremely idiomatic in Haskell and pleasant to program with. However, this
+are idiomatic in Haskell and pleasant to program with. However, this
 came with the huge drawback of having too many list-node allocations, consuming
 large amounts of memory and CPU time, and yielding overall terrible performance
 (the audio lags with just a few oscillators in 5 voices in even a high buffer
@@ -93,26 +92,34 @@ The current approach uses the reader monad, which means building up signals
 effectively boils down to a composition of time-dependent functions awaiting the
 application of the `(time, delta, channel)` reader context argument, which is
 only applied at the very end when the buffer needs to be written to. This is
-great: there are almost no allocations involved other than the index list at the
-very end for the buffer-writing, and is a lot faster, yielding smooth audio at
-44100Hz sample rate and a buffer size of 2048 (and maybe even 1024).
+nice enough: there are almost no allocations involved other than the index list
+at the very end for the buffer-writing, and is a lot faster, yielding smooth
+audio at 44100Hz sample rate and a buffer size of 2048 (and maybe even 1024).
 
 However, the one thing that the lazy list approach had that this doesn't is that
 once computed, list nodes (i.e. generated samples) are automatically memoized by
 the runtime. This allows the convolution functions (which require
 computation of the signal at time values in advance of the current time) to
-incur only a negligible performance hit with the lazy list representation since
-subsequent values can just be retrieved from the memoization. In contrast, in
-the reader monad approach, this kind of naive convolution results in massive
-performance loss and unworkable audio, since there is no memoization and the
-signal is effectively recalculated `n` times where `n` is the convolution window
-size.
+incur only a negligible performance hit since subsequent values can just be
+retrieved from the memoization. In contrast, in the reader monad approach, this
+kind of naive convolution results in massive performance loss and unworkable
+audio, since there is no memoization and the signal is effectively recalculated
+`n` times where `n` is the convolution window size.
 
-A good next task is thus to write some sort of FFT to turn this `O(n^2)`
-convolution into an `O(nlogn)` frequency-domain multiplication (which I'll need
-to look more into), as well as parallelization approaches to fill the buffer
-in a more efficient way.
+### Stateful signals
+The other huge disadvantage with this approach (that I haven't been able to work
+out nicely) is how to do *stateful* signals. To smoothly modulate the
+frequency of an oscillator (for something like portamento), simply inserting
+`freq = freqfunc(t)` as in e.g. `sin (2*pi*freqfunc(t)*t)` isn't going to work,
+as the resulting intermediate sine waves would be discontinuous and the
+intermediate waves not correct. Statefulness would also be a solution to
+filtering as above, since we would only need to keep track of a running average.
 
+My attempts at implementing this so far have blown up spectacularly; the natural
+thing to do is to replace the Reader monad with a State monad, but then each
+oscillator in each voice would need its own state value; and even naively
+replacing Reader with State with no functionality change already slows down the
+signal pipeline a whole lot, so something better and more clever must be used...
 
 ## Organization
 The library is in `src/`. The executable is in `exe/Main.hs`, which is
@@ -123,7 +130,9 @@ where we write test songs and synths to play around with.
 stack build
 stack run
 ```
-Requires SDL2 to be installed on the system.
+Requires SDL2 to be installed on the system. (also, the included `stack.yaml`
+uses the system ghc by default, which you might want to change depending on the
+config)
 
 Current `stack` resolver is `lts-16.22` (ghc 8.8.4).
 However, this should work with newer ghcs and resolvers just fine.
