@@ -19,7 +19,10 @@ is of type `(TimeVal, TimeVal, CurrChan)`, so we can just say
 ```haskell
 type Signal = Reader (TimeVal, TimeVal, CurrChan)
 ```
-and we get the niceties of the reader monad for free.
+and we get the niceties of the reader monad for free. (This simple, stateless,
+time-dependent-only formulation doesn't support truly correct and robust
+oscillators---see [stateful signals](#stateful-signals) for more on this, a
+solution for which I have yet to fully work out.)
 
 This means defining signal functions looks like this (where `getTime :: Signal
 TimeVal` is a monadic action that extracts the current time from the

@@ -23,7 +23,7 @@ module Sound.Hailstone.Synth
 , retriggerWithNotes
   -- ** Envelopes
 , ADSRParams(..)
-, linearRamp, adsrEnvelope
+, funcRamp, linearRamp, adsrEnvelope
 )
 where
 
@@ -256,13 +256,19 @@ retriggerWithNotes emptyVal sfunc cells =
 
 -- stuff for envelopes
 
--- | A linear ramp signal that increases from start to end (or optionally 
--- decreases) in a given duration, then holds
-linearRamp :: TimeVal -> SynthVal -> SynthVal -> Signal SynthVal
-linearRamp dur start end = if dur == 0 then pure end else getTime >>= \t -> pure $
+-- | A ramp signal that increases from start to end (or optionally 
+-- decreases) in a given duration based on some given function, then holds.
+-- For a linear ramp, the function should be \t -> t;
+-- For a quadratic ramp, the function is \t -> t*t etc.
+funcRamp :: (TimeVal -> SynthVal) -> TimeVal -> SynthVal -> SynthVal -> Signal SynthVal
+funcRamp f dur start end = if dur == 0 then pure end else getTime >>= \t -> pure $
   let downramp = start > end; smaller = min start end; bigger = max start end;
-      up = max smaller . min bigger $ smaller + (bigger - smaller) * (t / dur)
+      up = max smaller . min bigger $ smaller + (bigger - smaller) * (f $ t / dur)
   in if downramp then smaller + bigger - up else up
+
+-- | Specialization of funcRamp to a linear function
+linearRamp :: TimeVal -> SynthVal -> SynthVal -> Signal SynthVal
+linearRamp = funcRamp id
 
 -- | Create a signal that traverses an ADSR envelope according to some given
 -- envelope parameters.
