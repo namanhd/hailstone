@@ -29,7 +29,7 @@ type Vol = SynthVal
 -- centered, and 1.0 is hard right.
 type Pan = SynthVal
 
--- | Constants denoting mono and stereo (easier to read than Bools for the job.)
+-- | Channel mode.
 data ChanMode = Mono | Stereo
   deriving (Show, Eq)
 
@@ -45,13 +45,13 @@ type TimeVal = SynthVal
 type SampleVal = Int16
 
 -- | Note data cell; stores some basic playing properties of a note.
-data Cell = Cell 
+data Cell = Cell
   { freqOf :: Freq    -- ^Frequency of the note
   , volOf :: Vol      -- ^Volume of the note (should be between 0.0 and 1.0)
-  , durOf :: TimeVal  
+  , durOf :: TimeVal
   -- ^Duration of the note in seconds. This need not equal the total time
   -- setting in the ADSR parameters (see below)
-  , panOf :: Maybe Pan 
+  , panOf :: Maybe Pan
   -- ^The panning value is a `Maybe Pan` so that a pan value of `Nothing` should
   -- result in the note being played as a true mono signal, while @`Just` p@
   -- would imply a note to be played at panning value @p@ in stereo.
@@ -60,16 +60,15 @@ data Cell = Cell
   }
   deriving (Show, Eq)
 
--- TODO : EPIC IDEA! Have a generalized Cell that has signals for all of these
--- things. Signal frequency, Signal vol, etc etc. That way....
--- we can embed entire VOICES, and PATTERNS, into Cells! So we get a playlist
--- view/pattern sequencing mechanism, for free!!
+-- TODO : generalized Cell that has puts all of these fields in nodes. That
+-- way.... we can embed entire VOICES, and PATTERNS, into Cells. So we get a
+-- playlist view/pattern sequencing mechanism, for free...
 
 
 
 -- | Attack-decay-sustain-release envelope parameters. Values of type `SynthVal`
 -- are between 0 and 1.
-data ADSRParams = 
+data ADSRParams =
   ADSR { startLvlOf :: SynthVal
         -- ^The starting level for the envelope
        , attackTimeOf :: TimeVal

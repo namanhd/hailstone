@@ -1,9 +1,9 @@
 {-# LANGUAGE GADTs #-}
 
-module Sound.Hailstone.SDLAudio
+module Sound.Hailstone.Backends.SDLAudio
 ( openAudio
 , enableAudio
-, putSampleSource
+, putNode
 , lockAudio
 , resumeAudio
 , closeAudio
@@ -16,89 +16,70 @@ import Control.Concurrent.MVar
 import qualified SDL as SDL
 import Data.Word (Word16) -- for buffer size
 import qualified Data.Vector.Storable.Mutable as SMV
+import qualified Data.Vector.Unboxed as VU
 
 import Sound.Hailstone.Synth
 
-data SignalState = 
-  SigState { getSampleSource :: SampleSource
-           , getCurrTime :: TimeVal
-           , getDeltaTime :: TimeVal
-           , getCurrChan :: CurrChan
-           , getChanMode :: ChanMode
-           }
+timeLookahead :: ChanMode -> TimeVal -> Int -> TimeVal -> TimeVal
+timeLookahead cm t n d = if cm == Mono then t + (fromIntegral n) * d
+  else t + (fromIntegral $ n `div` 2) * d
 
-initSignalState :: SampleRate -> ChanMode -> SignalState
-initSignalState sampleRate chanMode = 
-  SigState { getSampleSource = pure 0
-           , getCurrTime = 0.0
-           , getDeltaTime = (1 / fromIntegral sampleRate)
-           , getCurrChan = if chanMode == Mono then CMono else CLeft
-           , getChanMode = chanMode
-           }
-
-consumeSignalState :: Int -> SignalState -> SMV.IOVector SampleVal -> IO SignalState
-consumeSignalState nSteps sigState audioBuf = 
-  mapM_ writer ([0..nSteps - 1]) *> pure modifiedState
+consumeSink :: Int -> Sink -> SMV.IOVector SampleVal -> IO Sink
+consumeSink buffLen sink audioBuf = ioNewSink
   where
-    chanLookahead :: ChanMode -> CurrChan -> Int -> CurrChan
-    chanLookahead cm' c' i' = if cm' == Mono then CMono else case c' of
-      CMono -> CMono
-      CLeft -> if (i' `rem` 2) == 0 then CLeft else CRight
-      CRight -> if (i' `rem` 2) == 0 then CRight else CLeft
-    
-    timeLookahead :: ChanMode -> TimeVal -> Int -> TimeVal -> TimeVal
-    timeLookahead cm' t' n' d' = if cm' == Mono then t' + (fromIntegral n') * d'
-      else t' + (fromIntegral $ n' `div` 2) * d'
+    d = getDeltaTime sink       -- delta time (= 1/sample rate)
+    n0 = getDestNode sink       -- audio node
+    t0 = getCurrTime sink       -- start time for this buffer
+    cm = getChanMode sink       -- channel mode of sink
 
-    d = getDeltaTime sigState       -- delta time (= 1/sample rate)
-    sig = getSampleSource sigState  -- signal
-    t0 = getCurrTime sigState       -- start time for this chunk
-    c0 = getCurrChan sigState       -- start channel for this chunk
-    cm = getChanMode sigState       -- channel mode of signal
-
-    modifiedState = sigState 
-     { getCurrTime = timeLookahead cm t0 nSteps d
-     , getCurrChan = chanLookahead cm c0 nSteps
-     }
-     
-    writer :: Int -> IO ()
-    writer idx = SMV.write audioBuf idx sampleVal
+    f :: Node (LR SampleVal) -> Int -> IO (Node (LR SampleVal))
+    f node idx = (if (cm == Stereo)
+        then SMV.write audioBuf idx l *> SMV.write audioBuf (idx + 1) r
+        else SMV.write audioBuf idx (l + r)) *> pure newNode
       where
         t = timeLookahead cm t0 idx d
-        c = chanLookahead cm c0 idx
-        sampleVal = sampleSignalAt t d c sig  -- sample the signal!!
+        (MkLR (l, r), newNode) = runNode (t, d) node
 
+    -- if stereo mode, then the index goes up in increments of 2 until it hits buffLen.
+    -- timeLookahead should already handle these indices properly given chanMode
+    -- (because stereo indices are even = left, odd = right), and the node generates
+    -- samples in LR pairs, so we only need to sample the node on even indices.
+    indices = if cm == Mono then VU.generate buffLen id else VU.generate (buffLen `div` 2) (* 2)
+    ioNewSink = (\finalNode -> sink
+      { getCurrTime = timeLookahead cm t0 buffLen d
+      , getDestNode = finalNode
+      }) <$> VU.foldM f n0 indices
 
 -- | SDL audio callback function; called whenever SDL needs more data in the
 -- audio buffer. This should copy samples into the buffer, or pad with silence
 -- if there is no more data to play
-sdlAudioCallback :: MVar SignalState  -- MVar state of the sample source stream
+sdlAudioCallback :: MVar Sink  -- MVar state
                  -> SDL.AudioFormat s  -- SDL Audio Format identifier
                  -> SMV.IOVector s     -- Mutable IO vector containing samples
                  -> IO ()
-sdlAudioCallback mSigState sdlAudioFormat sdlAudioBuffer = case sdlAudioFormat of
+sdlAudioCallback mSink sdlAudioFormat sdlAudioBuffer = case sdlAudioFormat of
   SDL.Signed16BitLEAudio -> do   -- turns out we need GADTs turned on for this
-    signalState <- takeMVar mSigState
+    sink <- takeMVar mSink
     let buffLen = SMV.length sdlAudioBuffer
     -- then copy the bytes into the IO vector, and consume the state throughout
-    modifiedSigState <- consumeSignalState buffLen signalState sdlAudioBuffer
+    modifiedSink <- consumeSink buffLen sink sdlAudioBuffer
 
     -- update the signal state MVar with the remainder of the signal
-    putMVar mSigState modifiedSigState
+    putMVar mSink modifiedSink
   _ -> putStrLn "Unsupported audio sample format"
 
 
 -- | Initialize SDL (the Audio subsystem only) given a sample rate and buffer
--- size, and create an `MVar` to store the output `SampleSource` signal.
-openAudio :: SampleRate -> Word16 -> ChanMode -> IO (SDL.AudioDevice, MVar SignalState)
+-- size, and create an `MVar` to store the output `SampleHose` signal.
+openAudio :: SampleRate -> Word16 -> ChanMode -> IO (SDL.AudioDevice, MVar Sink)
 openAudio sampleRate bufferSize chanMode = do
   SDL.initialize [SDL.InitAudio]
   let sampleType = SDL.Signed16BitNativeAudio
       stereoMode = case chanMode of
         Mono -> SDL.Mono
         Stereo -> SDL.Stereo
-  
-  initialSource <- newMVar $ initSignalState sampleRate chanMode
+
+  mSink <- newMVar $ initSink sampleRate chanMode
   -- function "requests" an audio spec from the hardware, using the
   -- requests/demands we specify in the Spec. It returns a spec, that has the
   -- true values that were provided, which hopefully matches our demands but
@@ -109,26 +90,26 @@ openAudio sampleRate bufferSize chanMode = do
     , SDL.openDeviceFormat = SDL.Mandate sampleType
     , SDL.openDeviceChannels = SDL.Mandate stereoMode
     , SDL.openDeviceSamples = bufferSize
-    , SDL.openDeviceCallback = sdlAudioCallback initialSource
+    , SDL.openDeviceCallback = sdlAudioCallback mSink
     , SDL.openDeviceUsage = SDL.ForPlayback
     , SDL.openDeviceName = Nothing -- any output audio device will do
     }
   -- TODO we should grab (SDL.audioSpecSilence spec) and somehow tell the Synth
   -- module that that value is what represents silence (for now we default to 0)
-  pure (device, initialSource)
+  pure (device, mSink)
 
 -- | Closes SDL audio. Should be called at the end of main.
 closeAudio :: SDL.AudioDevice -> IO ()
 closeAudio = SDL.closeAudioDevice
 
--- | Modify the MVar to store a new sample source stream.
-putSampleSource :: MVar SignalState -> SampleSource -> IO ()
-putSampleSource mv newSource = do
-  firstSigState <- takeMVar mv
+-- | Modify the MVar to store a new audio node tree.
+putNode :: MVar Sink -> Node (LR SampleVal) -> IO ()
+putNode mSink newNode = do
+  currSink <- takeMVar mSink
   -- update the sample source and reset the time counter, but don't change
   -- anything about the delta value and the curr-chan
-  let newSigState = firstSigState { getSampleSource = newSource, getCurrTime = 0.0 }
-  putMVar mv newSigState
+  let newSink = currSink { getDestNode = newNode, getCurrTime = 0.0 }
+  putMVar mSink newSink
 
 -- | Enable SDL audio. Should be called at the start of main.
 enableAudio :: SDL.AudioDevice -> IO ()
