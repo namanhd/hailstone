@@ -44,14 +44,10 @@ data Node x where
   -- ^binary node. can represent any time-varying computation taking two argument nodes, but
   -- can also be used to lift, into a node, via the applicative instance, the application of
   -- a pure function @f@ to a pure argument @a@.
-  MkNodeC :: s -> (SF a s (Either b x)) -> (Node a) -> (Node (b -> x)) -> Node x
-  -- ^"conditional" node, modeling conditional eval of an input node (because on running the
-  -- node tree, `MkNode2` strictly evaluates both child nodes unconditionally before it gets
-  -- evaluated itself.)
 ```
 > Note that the state type variable `s` does not show up on the left hand side of the data declaration. This makes `s` existentially quantified, i.e. `forall s. s -> ...`. Users of the `Node x` type cannot pattern match or know anything about the particular `s` type in use, only that it is compatible with the signal function `SF _ s x` it is bundled with.
 >
-> This makes sense, as implementations of audio nodes need not expose to the outside world what their internal state is or how it is used; different nodes in a node graph are sure to have different state needs internally, so it is only natural to hide `s` away rather than having it be parameterized in the datatype i.e. `Node s x`.
+> This makes sense, as implementations of audio nodes need not expose to the outside world what their internal state is or how it is used. Different nodes in a node graph are sure to have different state needs internally, so it is only natural to hide `s` away rather than having it be parameterized in the datatype i.e. `Node s x`.
 >
 > This is essentially encapsulation, where we've hidden the gory implementation details of statefulness, its type, and indeed even its presence.
 
@@ -68,33 +64,30 @@ runNode r = go
       (b, new_bNode) = go bNode
       (x, new_s) = runSF sig r (a, b) s
       in (x, MkNode2 new_s sig new_aNode new_bNode)
-    go (MkNodeC s sig aNode fNode) = let
-      (a, new_aNode) = go aNode
-      (ebx, new_s) = runSF sig r a s
-      (x, new_fNode) = case ebx of
-        Right xDefault -> (xDefault, fNode)
-        Left b -> let (f, new_fNode') = go fNode in (f b, new_fNode')
-      in (x, MkNodeC new_s sig new_aNode new_fNode)
 ```
-
 
 The comments in `Sound/Hailstone/Synth.hs` say more on the reasoning behind our choice of primitives/constructors and their evaluation semantics. However, this essentially lets us fairly directly translate object-oriented DSP code into our `Node` representation while preserving composability on the surface for users who use our provided nodes, combinators, and other functions.
 
-> (There's also a nice Applicative instance we get almost for free with `MkNode2`, useful for lifting pure code into nodes. Unfortunately a Monad instance eludes me; I suspect it may not be doable in a sensible way because in some sense you need to "preallocate state" for each node in the tree before it's ever run, and monadic bind for the `Node` type implies "dynamically producing a new node tree structure on the fly during evaluation", which has caused many issues in my attempts. In any case, the applicative interface and the existing composability are more than expressive enough.)
+> There's also a nice Applicative instance we get almost for free with `MkNode2`, useful for lifting pure code into nodes.
+>
+> However, a Monad instance is likely impossible for a similar reason [Swierstra & Duponcheel's LL(1) parser](https://dl.acm.org/doi/10.5555/647699.734159) doesn't have a Monad instance: the type packs static information (in our case, the node state; in their case, the "static parser") and in some sense we need to "preallocate state/static data" for every node/parser before the computation is executed, i.e. we need the ability to do static analysis. Yet the monadic bind for both the `Node` type and S&D's parser implies "dynamically producing static information on the fly during evaluation" for the *result of* `k` in `ma >>= k`, and there's no good way to do that. In both cases, however, the applicative interface is more than enough.
+>
+> There's an argument to be made to turn this into an Arrow; S&D's parser was indeed the [motivating argument for Hughes's Arrows](https://www.cse.chalmers.se/~rjmh/afp-arrows.pdf). It would be possible to try to convert the `Node` applicative to a proper Arrow, which is also the primary abstraction used by e.g. [Euterpea](https://hackage.haskell.org/package/Euterpea); however, arrows are somewhat clunky and so far I am doing fine with just the applicative instance. I will explore this later if it turns out to become necessary.
+>
+> One thing that arrows can do that applicatives on their own can't is **sharing** of an emitted value as the input to multiple other nodes, i.e. making the signal graph a directed acyclic graph (DAG) and not just a tree. As it is now, any time we bind a name to a node in the host language (Haskell) and use it in multiple places, that node gets *duplicated* (and thus its computation work repeated) at those use sites, rather than its output merely being reused as we might ideally want. The way to solve this without arrows is with **Observable Sharing**; Heinrich Apfelmus has a [good writeup regarding its use and implementation for reactive-banana](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md) (an FRP system that eschews arrows for a purely applicative interface.) This is something I'm interested in trying in at least some form--if not the black magic `unsafePerformIO` trick, then at least `Let` and `Var` constructs in the Node tree grammar.
 
-For instance, here's a sine oscillator that holds its current angle (and a cached precomputed value) as state, translated nearly directly from https://juce.com/tutorials/tutorial_sine_synth/.
+For instance, here's a sine oscillator that holds its current angle as state, translated nearly directly from https://juce.com/tutorials/tutorial_sine_synth/.
 
 ```haskell
-sinOsc :: Node Freq -> Node Vol -> Node SynthVal
-sinOsc = MkNode2 (0.0, Nothing) . sfr $ \(_, d) (f, vol) (myAngle, cachedDx2pi) -> let
-  deltaTimes2pi = maybe (d * twopi) id cachedDx2pi
-  angleDelta = f * deltaTimes2pi
+sinOsc :: Node Freq -> Node Gain -> Node SynthVal
+sinOsc = MkNode2 0.0 . sfr $ \(_, d) (f, gain) myAngle -> let
+  angleDelta = f * (d * twopi)
   newAngle = myAngle + angleDelta
   newAngleNormed = if newAngle > twopi then newAngle - twopi else newAngle
-  in (vol * sinFn myAngle, (newAngleNormed, Just deltaTimes2pi))
+  in (gain * sin myAngle, newAngleNormed)
 ```
 
-This is a function that takes two nodes (a frequency-emitting node and a volume-emitting node) and returns a stateful node that computes a sine wave, with state behind the scenes that the caller of this function  does not have to explicitly handle.
+This is a function that takes two nodes (a frequency-emitting node and a gain-emitting node) and returns a stateful node that computes a sine wave, with state behind the scenes that the caller of this function  does not have to explicitly handle.
 
 As the parameters to this node are themselves nodes, only function application is needed to build up a complex node tree representing complex modulations, with correctly-handled states when the tree is finally evaluated.
 
@@ -115,30 +108,29 @@ sinWithRampingVibrato f v = sinOsc (f * (1 + sinOsc (linearRamp 1.2 5 12) 0.02))
 
 
 The `Node` representation, in addition to signal processing and synthesis, can also do larger-scale sequencing.
-Nodes can be sequenced `piecewise`; one can define a node to be
-composed of different nodes that play back in sequence, each with a given playback duration.
+Nodes can be sequenced `piecewise` (i.e. back-to-back, no overlap/monophonic), or `cascade`, (i.e. simply splats nodes onto a timeline, summing them, allowing overlaps).
 
-For reference, `piecewise`'s type is
 ```haskell
-piecewise :: TimeVal -> a -> [(Node a, TimeVal)] -> Node a
+piecewise :: TimeVal -> a -> [(Node a, TimeVal, Maybe Timeval)] -> Node a
+cascade :: TimeVal -> a -> [(Node a, TimeVal, Maybe Timeval)] -> Node a
 ```
-An expression like
+
+So an expression like
 ```haskell
-piecewise 5.0 0.0 [(node1, 1.0), (node2, 2.0)]
+cascade 5.0 0.0 [(node1, 0.0, Nothing), (node2, 0.5, Just 2.0)]
 ```
-will create a node that emits silence (the `0.0` argument) until time `t=5.0`, when it plays `node1` for `1.0` second, then `node2` for `2.0` seconds, then silence (`0.0`) again afterwards.
+will create a node that emits silence (the `0.0` argument) until time `t=5.0`, at which point it starts the sequence of nodes starting with `node1` (note its start time `0.0` relative to when the sequence begins, i.e. `t=5`) which plays indefinitely (indicated by the `Nothing` duration), then `node2` starts at `t=5.5` (relative time `0.5`) which plays for `2.0` seconds.
 
-With `piecewise`, we can then define some nice audio/synthesis features:
-
-- `retriggerWithNotes` restarts a synth node (any frequency and volume-parameterized node) on every new note, effectively
-allowing one to "play a melody using a synth/instrument" by creating a keystroke
-effect that retriggers and modulates the synth signal on every new note rather
-than letting the synth sound evolve independently of the notes.
-- `adsrEnvelope` together with `linearRamp` creates a signal that traverses an
-Attack - Decay - Sustain - Release (ADSR) envelope, which can then be multiplied
-by individual note-playing signals (for per-note ADSR), or entire summed signals
-(for envelope-based modulation of volume, panning, even synthesis parameters
-across playback).
+- Built on top of `piecewise` or `cascade`, the function `retriggerWith` plays a melody
+using a "synth/instrument" by restarting a synth node (any frequency and gain-parameterized
+node) on every new note, effectively by creating a keystroke effect that retriggers and
+modulates the synth signal on every new note rather than letting the synth sound evolve
+independently of the notes.
+- There's also `adsrEnvelope` (taking fixed ADSR parameters) and `adsrEnvelopeN`
+(parameterized by a node emitting ADSR parameters) which create a signal that traverses an
+Attack - Decay - Sustain - Release (ADSR) envelope, which can then be multiplied by
+individual note-playing signals (for per-note ADSR), or entire summed signals (for
+envelope-based modulation of gain, panning, even synthesis parameters across playback).
 
 ## Composition
 TODO!
@@ -147,9 +139,13 @@ TODO!
 
 Performance. Most everyone has given up on getting end-to-end Haskell audio to be real-time capable; even the [venerable co-author of Euterpea and the  Haskell School of Music](https://www.donyaquick.com/vivid-as-a-real-time-audio-solution-for-euterpea/) has sworn off attempting real-time in pure Haskell.
 
-That said, I still think this is really interesting to work through for learning both Haskell and DSP.
+That said, I still think this is really interesting to work through for learning both Haskell and DSP. With some effort
+in adding strictness annotations and representing state using simpler/even unboxed types, we can prevent space leaks, and
+using wavetables for trigonometry functions may also help with computation speed.
 
-The `Node` representation is a big step up from my previous attempts (4 years ago... ouch.) Before this I'd hopped around representations, first lazy infinite lists, which had free memoization by the runtime but were extremely allocation-heavy, then the simple `t -> x` reader monad which did not have statefulness that could compose. It's cool to have landed on something that seems to address these issues, though there will be definitely many more problems. For any nontrivial audio processing, this will probably still need to be offline rather than real-time. That said, I'm doing my testing via SDL audio to play audio as the program runs.
+The `Node` representation is a big step up from my previous attempts (4 years ago... ouch.) Before this I'd hopped around representations, first lazy infinite lists, which had free memoization by the runtime but were extremely allocation-heavy, then the simple `t -> x` reader monad which did not have statefulness that could compose. It's cool to have landed on something that seems to address these issues, though there will be definitely many more problems.
+
+For any nontrivial audio processing, this will probably still need to be offline rather than real-time. That said, I'm doing my testing via SDL audio to play audio as the program runs.
 
 ## Organization
 The library is in `src/`, and only depends on `mtl` at the moment. You can load the `Sound.Hailstone.Synth` module in GHCi or another Main to try it out directly, no `stack` or package installations needed.
