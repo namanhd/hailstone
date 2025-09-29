@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedRecordDot, DuplicateRecordFields, BangPatterns #-}
 
 module Sound.Hailstone.Types
 ( -- * Type synonyms and datatypes
@@ -15,6 +15,7 @@ module Sound.Hailstone.Types
   -- ** Note data & config
 , ChanMode(..)
 , Cell(..)
+, LiveCell(..)
 , ADSRParams(..)
 , mkADSRez
 , adsrTotalTime
@@ -54,20 +55,33 @@ type SampleVal = Int16
 
 -- | Note data cell; stores some basic playing properties of a note.
 data Cell = Cell
-  { _freq :: Freq -- ^Frequency of the note
-  , _gain :: Gain -- ^Gain of the note as a linear multiplier (should be between 0 and 1)
-  , _start :: TimeVal -- ^Start time of the note in seconds.
-  , _dur :: TimeVal
+  { freq :: !Freq -- ^Frequency of the note
+  , gain :: !Gain -- ^Gain of the note as a linear multiplier (should be between 0 and 1)
+  , start :: !TimeVal -- ^Start time of the note in seconds.
+  , dur :: !TimeVal
   -- ^Duration of the note in seconds, which needs not equal the `adsrTotalTime` of `_adsr`;
   -- this will, however, be the duration after which the cell is hard cut off.
-  , _pan :: Maybe Pan
+  , pan :: !(Maybe Pan)
   -- ^The panning value is a `Maybe Pan` so that a pan value of `Nothing` should result in
   -- the note being played as a mono or centered signal, while @`Just` p@ would imply a note
   -- to be played at panning value @p@ in stereo.
-  , _adsr :: ADSRParams
+  , adsr :: {-# UNPACK #-} !ADSRParams
   -- ^ The envelope settings for this note.
   }
   deriving (Show, Eq)
+
+-- | A "live cell" is what an instrument will receive from a `Node` to play a note specified
+-- by a `Cell`, which describes high-level static information. The `Cell` might specify some
+-- varying frequency or gain (per-note portamento, vibrato, or volume slide effect) and this
+-- is reflected as time-varying `LiveCell`s emitted to the instrument upon every new sample.
+-- There may be more metadata here such as arbitrary modulation values that can be mapped to
+-- any parameter in the instrument, like ModX & ModY on notes wrt. FL Studio native plugins.
+data LiveCell = LC
+  { freq :: !Freq -- ^ current frequency
+  , gain :: !Gain -- ^ current gain
+  , pan :: !Pan -- ^ current pan
+  , env :: !SynthVal -- ^ current value of the envelope
+  } deriving (Show, Eq)
 
 -- TODO : generalized Cell that has puts all of these fields in nodes. That
 -- way.... we can embed entire VOICES, and PATTERNS, into Cells. So we get a
@@ -75,27 +89,26 @@ data Cell = Cell
 
 -- | Attack-decay-sustain-release envelope parameters. Values of type `SynthVal`
 -- used here, which are "levels" or "gains", are between 0 and 1 inclusive.
-data ADSRParams =
-  ADSR { _v0 :: SynthVal
-        -- ^The starting level for the envelope
-       , _tA :: TimeVal
-        -- ^Time taken to go from the starting level to 1.0
-       , _tD :: TimeVal
-        -- ^Time taken to decay from 1.0 to the sustain level
-       , _v1 :: SynthVal
-        -- ^Sustain level
-       , _tS :: TimeVal
-        -- ^Sustain time
-       , _tR :: TimeVal
-        -- ^Time taken to release from sustain level to end level
-       , _v2 :: SynthVal
-        -- ^End level
-       }
-  deriving (Show, Eq)
+data ADSRParams = ADSR
+  { _v0 :: !SynthVal
+    -- ^The starting level for the envelope
+  , _tA :: !TimeVal
+    -- ^Time taken to go from the starting level to 1.0
+  , _tD :: !TimeVal
+    -- ^Time taken to decay from 1.0 to the sustain level
+  , _v1 :: !SynthVal
+    -- ^Sustain level
+  , _tS :: !TimeVal
+    -- ^Sustain time
+  , _tR :: !TimeVal
+    -- ^Time taken to release from sustain level to end level
+  , _v2 :: !SynthVal
+    -- ^End level
+  } deriving (Show, Eq)
 
 -- | Prefilled `ADSRParams` with common defaults (`startLvlOf` = 0, `endLvlOf` = 0)
 mkADSRez :: TimeVal -> TimeVal -> SynthVal -> TimeVal -> TimeVal -> ADSRParams
-mkADSRez tA tD vS tS tR =
+mkADSRez !tA !tD !vS !tS !tR =
   ADSR  { _v0 = 0.0
         , _tA = tA
         , _tD = tD
@@ -107,11 +120,12 @@ mkADSRez tA tD vS tS tR =
 
 -- | Total time taken by the envelope, the sum of the A, D, S, R durations
 adsrTotalTime :: ADSRParams -> TimeVal
-adsrTotalTime (ADSR _ tA tD _ tS tR _)  = tA + tD + tS + tR
+adsrTotalTime (ADSR _ !tA !tD _ !tS !tR _)  = tA + tD + tS + tR
 
 -- | Unwraps Maybe Pan. Only useful if we're doing any sort of stereo at all;
 -- defaults Nothing pan to mean 0.5
-unmaybePan :: Maybe Pan -> Pan
+unmaybePan :: Fractional a => Maybe a -> a
+{-# SPECIALIZE unmaybePan :: Maybe Pan -> Pan #-}
 unmaybePan = maybe 0.5 id
 
 -- | Convenience tuple of two audio values, one for each channel (left and right).

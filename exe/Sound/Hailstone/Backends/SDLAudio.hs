@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs #-}
+{-# LANGUAGE GADTs, BangPatterns #-}
 
 module Sound.Hailstone.Backends.SDLAudio
 ( openAudio
@@ -21,11 +21,11 @@ import qualified Data.Vector.Unboxed as VU
 import Sound.Hailstone.Synth
 
 timeLookahead :: ChanMode -> TimeVal -> Int -> TimeVal -> TimeVal
-timeLookahead cm t n d = if cm == Mono then t + (fromIntegral n) * d
+timeLookahead !cm !t !n !d = if cm == Mono then t + (fromIntegral n) * d
   else t + (fromIntegral $ n `div` 2) * d
 
 consumeSink :: Int -> Sink -> SMV.IOVector SampleVal -> IO Sink
-consumeSink buffLen sink audioBuf = ioNewSink
+consumeSink !buffLen !sink !audioBuf = ioNewSink
   where
     d = getDeltaTime sink       -- delta time (= 1/sample rate)
     n0 = getDestNode sink       -- audio node
@@ -33,19 +33,20 @@ consumeSink buffLen sink audioBuf = ioNewSink
     cm = getChanMode sink       -- channel mode of sink
 
     f :: Node (LR SampleVal) -> Int -> IO (Node (LR SampleVal))
-    f node idx = (if (cm == Stereo)
-        then SMV.write audioBuf idx l *> SMV.write audioBuf (idx + 1) r
-        else SMV.write audioBuf idx (l + r)) *> pure newNode
+    f !node !idx = (case cm of
+        Stereo -> SMV.write audioBuf idx l *> SMV.write audioBuf (idx + 1) r
+        Mono -> SMV.write audioBuf idx (l + r)) *> pure newNode
       where
-        t = timeLookahead cm t0 idx d
-        (MkLR (l, r), newNode) = runNode (t, d) node
+        !t = timeLookahead cm t0 idx d
+        (MkLR (!l, !r), newNode) = runNode (t, d) node
+    {-# INLINE f #-}
 
     -- if stereo mode, then the index goes up in increments of 2 until it hits buffLen.
     -- timeLookahead should already handle these indices properly given chanMode
     -- (because stereo indices are even = left, odd = right), and the node generates
     -- samples in LR pairs, so we only need to sample the node on even indices.
     indices = if cm == Mono then VU.generate buffLen id else VU.generate (buffLen `div` 2) (* 2)
-    ioNewSink = (\finalNode -> sink
+    ioNewSink = (\(!finalNode) -> sink
       { getCurrTime = timeLookahead cm t0 buffLen d
       , getDestNode = finalNode
       }) <$> VU.foldM f n0 indices
@@ -59,7 +60,7 @@ sdlAudioCallback :: MVar Sink  -- MVar state
                  -> IO ()
 sdlAudioCallback mSink sdlAudioFormat sdlAudioBuffer = case sdlAudioFormat of
   SDL.Signed16BitLEAudio -> do   -- turns out we need GADTs turned on for this
-    sink <- takeMVar mSink
+    !sink <- takeMVar mSink
     let buffLen = SMV.length sdlAudioBuffer
     -- then copy the bytes into the IO vector, and consume the state throughout
     modifiedSink <- consumeSink buffLen sink sdlAudioBuffer

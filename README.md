@@ -3,7 +3,9 @@
 haskell audio synthesis + song composition embedded languages
 
 ## Synthesis
-At the moment, (as of 2025-09) the modular audio system consists of `Node`s, which are a tree-like structure.
+(as of 2025-09)
+
+The modular audio system consists of `Node`s, which are a tree-like structure.
 Each `Node x` packages a state `s` together with a "signal function" `SF a s x` that reads the signal environment (i.e. current time, sample rate), its current state `s`, optionally an "argument" `a` emitted from some input/argument `Node a`, and returns an emitted value `x` and an updated state.
 
 A signal function thus has the type
@@ -80,14 +82,14 @@ For instance, here's a sine oscillator that holds its current angle as state, tr
 
 ```haskell
 sinOsc :: Node Freq -> Node Gain -> Node SynthVal
-sinOsc = MkNode2 0.0 . sfr $ \(_, d) (f, gain) myAngle -> let
+sinOsc = MkNode2 0.0 . sfr $ \(_, d) (f, gain) angleAccum -> let
   angleDelta = f * (d * twopi)
-  newAngle = myAngle + angleDelta
-  newAngleNormed = if newAngle > twopi then newAngle - twopi else newAngle
-  in (gain * sin myAngle, newAngleNormed)
+  newAccum' = angleAccum + angleDelta
+  newAccum = if newAccum' > twopi then newAccum' - twopi else newAccum'
+  in (gain * sin angleAccum, newAccum)
 ```
 
-This is a function that takes two nodes (a frequency-emitting node and a gain-emitting node) and returns a stateful node that computes a sine wave, with state behind the scenes that the caller of this function  does not have to explicitly handle.
+This is a function that takes two nodes (a frequency-emitting node and a gain-emitting node) and returns a stateful node that computes a sine wave, with state behind the scenes (a phase accumulator, for accurate pitch slides and other synthesis) that the caller of this function does not have to explicitly handle.
 
 As the parameters to this node are themselves nodes, only function application is needed to build up a complex node tree representing complex modulations, with correctly-handled states when the tree is finally evaluated.
 
@@ -108,24 +110,29 @@ sinWithRampingVibrato f v = sinOsc (f * (1 + sinOsc (linearRamp 1.2 5 12) 0.02))
 
 
 The `Node` representation, in addition to signal processing and synthesis, can also do larger-scale sequencing.
-Nodes can be sequenced `piecewise` (i.e. back-to-back, no overlap/monophonic), or `cascade`, (i.e. simply splats nodes onto a timeline, summing them, allowing overlaps).
+Nodes can be sequenced `piecewiseMono` (i.e. back-to-back, no overlap/monophonic), or `cascade`, (i.e. simply splats time-shifted nodes onto a timeline, summing them, allowing overlaps), or `piecewisePoly` (i.e. allocates nodes into voices of non-overlapping segments, processing each voice with `piecewiseMono`, then summing those streams), preferred and more efficient than `cascade`.
 
 ```haskell
-piecewise :: TimeVal -> a -> [(Node a, TimeVal, Maybe Timeval)] -> Node a
-cascade :: TimeVal -> a -> [(Node a, TimeVal, Maybe Timeval)] -> Node a
+piecewiseMono :: TimeVal -> a -> [(Node a, TimeVal, Maybe Timeval)] -> Node a
+piecewisePoly :: TimeVal -> a -> [(Node a, TimeVal, Maybe Timeval)] -> Node a
 ```
 
 So an expression like
 ```haskell
-cascade 5.0 0.0 [(node1, 0.0, Nothing), (node2, 0.5, Just 2.0)]
+piecewisePoly 5.0 0.0 [(node1, 0.0, 10.0), (node2, 0.5, Just 2.0)]
 ```
-will create a node that emits silence (the `0.0` argument) until time `t=5.0`, at which point it starts the sequence of nodes starting with `node1` (note its start time `0.0` relative to when the sequence begins, i.e. `t=5`) which plays indefinitely (indicated by the `Nothing` duration), then `node2` starts at `t=5.5` (relative time `0.5`) which plays for `2.0` seconds.
+will create a node that emits silence (the `0.0` argument) until time `t=5.0`, at which point it starts the sequence of nodes starting with `node1` (note its start time `0.0` relative to when the sequence begins, i.e. `t=5`) which plays for 10 seconds, while `node2` starts at `t=5.5` (relative time `0.5`) which plays for `2.0` seconds, with
+`node1` still playing.
 
-- Built on top of `piecewise` or `cascade`, the function `retriggerWith` plays a melody
-using a "synth/instrument" by restarting a synth node (any frequency and gain-parameterized
-node) on every new note, effectively by creating a keystroke effect that retriggers and
-modulates the synth signal on every new note rather than letting the synth sound evolve
-independently of the notes.
+- Built on top of `piecewise`, the function `retriggerWith` plays a melody
+using a "synth/instrument" by restarting a synth node on every new note,
+effectively by creating a keystroke effect that retriggers and modulates the
+synth signal on every new note rather than letting the synth sound evolve
+independently of the notes. Instruments are functions parameterized by a Node of `LiveCell`
+values, which are evolving parameters rendered from the higher-level static `Cell` specification of a note.
+This way, a synth can react to a note's gain, envelope, and any other high-level modulating
+parameters (which will allow e.g. note-level effects with per-note parameters such as per-note
+vibrato, portamento, etc.)
 - There's also `adsrEnvelope` (taking fixed ADSR parameters) and `adsrEnvelopeN`
 (parameterized by a node emitting ADSR parameters) which create a signal that traverses an
 Attack - Decay - Sustain - Release (ADSR) envelope, which can then be multiplied by

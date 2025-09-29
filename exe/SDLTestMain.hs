@@ -1,7 +1,9 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 -- Test main executable, for trying out songs and synths
 
 module Main where
 
+import Data.Functor ((<&>))
 import Sound.Hailstone.Synth
 import Sound.Hailstone.Backends.SDLAudio
 import Control.Concurrent (threadDelay)
@@ -9,9 +11,9 @@ import Control.Concurrent (threadDelay)
 testSong :: [Cell]
 testSong = let
   nop = Nothing
-  dur = 0.5
+  du = 0.5
   myAdsr = ADSR 0.9 0.01 0.0 0.9 0.1 0.2 0.0
-  in (\cc -> cc dur nop myAdsr) <$>
+  in (\cc -> cc du nop myAdsr) <$>
   [ Cell 440 0.25 0.0
   , Cell 550 0.25 0.5
   , Cell 660 0.25 1.0
@@ -32,13 +34,14 @@ testSong2 = let
   downp4 = ((3/4) *)
   maj10 = ((10/4) *)
   maj7 = ((30/16) *)
+  maj3 = ((5/4) *)
   r = 220
   in (\cc -> cc sxthlen nop myAdsr) <$>
   [ Cell r 0.4 (b 0)
   , Cell (maj7 r) 0.25 (b 2), Cell (maj10 r) 0.25 (b 2)
   , Cell r 0.4 (b 3)
   , Cell (downp5 r) 0.4 (b 4)
-  , Cell (p5 r) 0.25 (b 5), Cell (maj7 r) 0.25 (b 5)
+  , Cell (maj3 r) 0.25 (b 5), Cell (maj7 r) 0.25 (b 5), Cell (maj10 r) 0.25 (b 5)
   , Cell (downp4 r) 0.4 (b 7)
   , Cell r 0.4 (b 8)
   , Cell (maj10 r) 0.25 (b 9), Cell (maj7 r) 0.25 (b 9)
@@ -58,20 +61,41 @@ testSong2 = let
 n :: Freq -> Gain -> TimeVal -> TimeVal -> Maybe Pan -> ADSRParams -> Cell
 n = Cell
 
-testSynth0 :: Node Freq -> Node Gain -> Node (LR SynthVal)
-testSynth0 f v =
-  m2s $ sinOsc (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02)) v
-
-testSynth1 :: Node Freq -> Node Gain -> Node (LR SynthVal)
-testSynth1 f v = finalNode
+testSynth0 :: Node LiveCell -> Node (LR SynthVal)
+testSynth0 lc = finalNode
   where
-    sinModulator0 = sinOsc (2 *| f) 5.0
-    sinModulator1 = sinOsc (f * (11 +| sinModulator0)) 0.5
-    sinModulator2 = sinOsc (f * (7 +| sinModulator1)) 1.2
-    sinModulator3 = sinOsc (f * (3 +| sinModulator2)) 1.5
-    fsWithVibrato = (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
-    sinCarrier = sinOscP sinModulator3 fsWithVibrato v
-    finalNode = m2s $ sinCarrier
+    f = lc <&> (.freq)
+    g = lc <&> (.gain)
+    e = lc <&> (.env) -- note envelope current value
+    -- pan = lc <&> (.pan)
+    finalNode = m2s $ e * sinOsc (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02)) g
+
+testSynth1 :: Node LiveCell -> Node (LR SynthVal)
+testSynth1 lc = finalNode
+  where
+    f = lc <&> (.freq)
+    g = lc <&> (.gain)
+    e = lc <&> (.env) -- note envelope current value
+    -- pan = lc <&> (.pan)
+    sinModulator3 = adsrEnvelope (ADSR 0.0 0.02 0.0 1.0 0.02 0.01 1.0) * sinOsc (5 *| f) e
+    fWithVibrato = (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
+    sinCarrier = sinOscP sinModulator3 fWithVibrato g
+    finalNode = m2s $ e * sinCarrier
+
+testSynth2 :: Node LiveCell -> Node (LR SynthVal)
+testSynth2 lc = finalNode
+  where
+    f = lc <&> (.freq)
+    g = lc <&> (.gain)
+    e = lc <&> (.env) -- note envelope current value
+    sinModulator1 = e * nADSR 0.1 0.04 0.0 1.0 0.05 0.01 1.0 * sinOsc (5 *| f) 0.7
+    -- also apply a pitch envelope on top of vibrato
+    fWithVibrato = nADSR 0.0 0.01 0.0 1.0 0.05 0.01 1.0 * (f * (1 +| sinOsc 5 0.02))
+    sinCarrier1 = sinOscP sinModulator1 fWithVibrato g
+    sinModulator2 = nADSR 1.0 0.0 0.0 1.0 0.0 0.07 0.0 * sinOsc (6 *| f) 1.2
+    sinCarrier2 = sinOscP sinModulator2 (2 *| fWithVibrato) g
+    finalNode = m2s $ e * (sinCarrier1 + sinCarrier2)
+
 
 tonetestmainSDL :: IO ()
 tonetestmainSDL = do
@@ -84,7 +108,7 @@ tonetestmainSDL = do
   let
     playNotes synth notes = retriggerWith
       EnvelopeIgnoresCellDuration RetrigPolyphonic 0.0 0.0 synth notes
-    summedNode = playNotes testSynth1 testSong2
+    summedNode = playNotes testSynth2 testSong2
     destNode = asPCM summedNode
 
   putNode mSink destNode

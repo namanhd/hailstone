@@ -1,4 +1,5 @@
-{-# LANGUAGE GADTs, BangPatterns, MultiWayIf, OverloadedRecordDot #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE BangPatterns, MultiWayIf, OverloadedRecordDot, DuplicateRecordFields #-}
 
 module Sound.Hailstone.Synth
 ( -- * Audio nodes
@@ -18,30 +19,32 @@ module Sound.Hailstone.Synth
   -- ** Numeric and stereo conversions
 , roundClip, asPCM, stereoize, stereoizeN, m2s
   -- ** Sequencing
-, startAt, piecewise, cascade
+, startAt, piecewiseMono, piecewisePoly, cascade
   -- *** Retriggering with `Cell`s
 , EnvelopeCellDurationMode(..), RetriggerMode(..)
 , retriggerWith
   -- ** Envelopes
 , ADSRParams(..)
 , mkADSRez
-, adsrEnvelope, adsrEnvelopeN
+, adsrEnvelope, adsrEnvelopeN, nADSR
 , funcRamp, linearRamp
   -- ** Generators
 , sinOsc, sinOscP
   -- * Re-exports
 , SynthVal, Freq, Gain, Pan, SampleRate, TimeVal, SampleVal
 , ChanMode(..)
-, Cell(..)
+, Cell(..), LiveCell(..)
 , LR(..)
 )
 where
 
+import Data.Ord (clamp)
 import Data.List (sortOn)
 import Data.Functor ((<&>))
 import Control.Monad.Reader
 import Control.Monad.State.Strict
 import Sound.Hailstone.Types
+import Sound.Hailstone.VoiceAlloc (voiceAlloc)
 
 --------------------------------------------------------------------------------
 -- * Signal functions
@@ -254,12 +257,12 @@ initSink sampleRate chanMode =
 -- | Generic accumulator node, with a `start` state plus an accumulator `accumFn`. The state
 -- updates every time a value is emitted; the emitted value is that state.
 accum :: Show s => s -> (i -> s -> s) -> Node i -> Node s
-accum start accumFn = mkNode1 start $ sfArgs >>= \i -> modify (accumFn i) *> get
+accum sta accumFn = mkNode1 sta $ sfArgs >>= \i -> modify (accumFn i) *> get
 
 -- | Simple counter/ticker, from a `start` value and an `increment` from a node.  That state
 -- is then emitted.
 tick :: (Num a, Show a) => a -> Node a -> Node a
-tick start = mkNode1 start $ sfArgs >>= \i -> state $ \s -> (s, s + i)
+tick sta = mkNode1 sta $ sfArgs >>= \i -> state $ \s -> (s, s + i)
 
 -- test stuff
 -- __testenv = (0.0 :: TimeVal, 1.0 :: TimeVal)
@@ -294,14 +297,14 @@ infixl 4 |*|
 (+|) :: (Num a) => a -> Node a -> Node a
 {-# SPECIALIZE[0] (+|) :: SynthVal -> Node SynthVal -> Node SynthVal #-}
 (+|) addend = fmap (addend +)
-infixr 6 +|
+infixr 7 +|
 {-# INLINABLE (+|) #-}
 
 -- | Scale a node by a scalar multiplier.
 (*|) :: (Num a) => a -> Node a -> Node a
 {-# SPECIALIZE (*|) :: SynthVal -> Node SynthVal -> Node SynthVal #-}
 (*|) multiplier = fmap (multiplier *)
-infixr 7 *|
+infixr 8 *|
 {-# INLINABLE (*|) #-}
 
 -- | Warp the time axis for a node using a function that modifies time AND its derivative to
@@ -318,10 +321,11 @@ modifyTime f df node = case node of
 
 -- | Have a node start emitting at a start time (and possibly end after some duration), else
 -- emitting a default empty value outside the allowed timespan.
-startAt :: a -> TimeVal -> Maybe TimeVal -> Node a -> Node a
-startAt empt start mdur node' = MkNode0 (modifyTime (subtract start) id node')
-  (sfr $ \r@(t, _) _ node -> let nop = (empt, node) in if t < start then nop else case mdur of
-    Nothing -> runNode r node; Just dur -> if t < (start + dur) then runNode r node else nop)
+startAt :: a -> TimeVal -> TimeVal -> Node a -> Node a
+startAt empt sta du node' = MkNode0 (modifyTime (subtract sta) id node') . sfr $ \r@(!t, _) _ !node -> if
+  | t < sta -> (empt, node)
+  | t < (sta + du) -> runNode r node
+  | otherwise -> (empt, node)
 
 --------------------------------------------------------------------------------
 -- ** Numeric and stereo conversions
@@ -342,14 +346,14 @@ asPCM = roundClip . (*|) (fromIntegral (maxBound :: SampleVal))
 -- is centered, and 1.0 is hard right.  (Though, no bounds checking is done to ensure this.)
 -- See `stereoize` for a version where the pan value can be emitted from an argument `Node`.
 stereoize :: (Num a) => a -> Either (Node a) (Node (LR a)) -> Node (LR a)
-stereoize pan (Left monoNode) = fmap (\a -> MkLR (((1 - pan) * a), (pan * a))) monoNode
-stereoize pan (Right stereoNode) = fmap (\(MkLR (al, ar)) -> let a = al + ar in MkLR (((1 - pan) * a), (pan * a))) stereoNode
+stereoize p (Left monoNode) = fmap (\a -> MkLR (((1 - p) * a), (p * a))) monoNode
+stereoize p (Right stereoNode) = fmap (\(MkLR (al, ar)) -> let a = al + ar in MkLR (((1 - p) * a), (p * a))) stereoNode
 
 -- | The node-parameterized version of `stereoize`, where pan values may be from a node and
 -- not constant.
 stereoizeN :: (Num a) => Node a -> Either (Node a) (Node (LR a)) -> Node (LR a)
-stereoizeN panNode (Left monoNode) = liftA2 (\pan a -> MkLR (((1 - pan) * a), (pan * a))) panNode monoNode
-stereoizeN panNode (Right stereoNode) = liftA2 (\pan (MkLR (al, ar)) -> let a = al + ar in MkLR (((1 - pan) * a), (pan * a))) panNode stereoNode
+stereoizeN panNode (Left monoNode) = liftA2 (\p a -> MkLR (((1 - p) * a), (p * a))) panNode monoNode
+stereoizeN panNode (Right stereoNode) = liftA2 (\p (MkLR (al, ar)) -> let a = al + ar in MkLR (((1 - p) * a), (p * a))) panNode stereoNode
 
 -- | mono2stereo. Convenience to turn a mono real-valued signal into a stereo signal.
 m2s :: (Fractional a) => Node a -> Node (LR a)
@@ -358,55 +362,60 @@ m2s = stereoize 0.5 . Left
 --------------------------------------------------------------------------------
 -- ** Sequencing
 
--- | Sequence nodes together monophonically, given their start times.
-piecewise :: TimeVal
-          -- ^the start time for this sequence of nodes
-          -> a -- ^empty value to emit when no nodes are scheduled to be playing
-          -> [(Node a, TimeVal, Maybe TimeVal)]
-          -- ^a list of @[(node, start, maybeDuration)]@; @node@ starts at @start@ and plays
-          -- until the next node with the next start time. @maybeDuration@ is ignored except
-          -- for the last node in start order!!
-          -> Node a
-piecewise t0 empt nodesDurs = out
+-- | Sequence nodes together monophonically, given their start times and durations.
+piecewiseMono :: TimeVal
+              -- ^the start time for this sequence of nodes
+              -> a -- ^empty value to emit when no nodes are scheduled to be playing
+              -> [(Node a, TimeVal, TimeVal)]
+              -- ^a list of @[(node, start, duration)]@, __assumed to already be sorted by
+              -- start time!!__ The node starts at @start@ and plays til the next node with
+              -- the next start time. @duration@ is ignored except for the last node.
+              -> Node a
+piecewiseMono t0 empt nodesDurs = out
   where
-  -- sort by start time, apply (t0+start) offsets to everyone
-  nodesDurs' =
-    fmap (\(node, sta, mdur) -> let sta' = sta + t0
-      in (startAt empt sta' mdur node, sta', mdur)) $ sortOn (\(_, sta, _) -> sta) nodesDurs
+  -- assume sorted by start time, apply (t0+start) offsets to everyone
+  nodesDurs' = fmap (\(node, sta, du) -> let sta' = sta + t0
+    in (startAt empt sta' du node, sta', du)) $ nodesDurs
   -- get initial state and form the output node
   out = case nodesDurs' of
-    ((firstNode,firstStartTime,firstMDur):restNodes) -> MkNode0
-      (firstNode, firstStartTime, firstMDur, restNodes)
-      (sfEnv >>= \r@(t, _) -> state $ customMap t r)
     [] -> pure empt
+    ((firstNode, firstStart, firstDur):restNodes) -> MkNode0
+      (firstNode, firstStart, firstDur, restNodes) (sfEnv >>= state . gogo)
   -- the state function for the node. check the start time of the next node and switch to it
   -- and consume one node from the list if its time is here, otherwise just keep playing the
   -- current node
-  customMap t r (!currNode, !currStartTime, !currMDur, nil@[]) = let
-    (x, new_currNode) = case currMDur of
-      Nothing -> runNode r currNode
-      Just dur -> if t < currStartTime + dur then runNode r currNode else (empt, currNode)
-    in (x, (new_currNode, currStartTime, currMDur, nil))
-  customMap t r s@(currNode, !currStartTime, currMDur, ls@((nextNode, !nextStartTime, nextMDur):rest))
-    | t < currStartTime = (empt, s)
-    | t < nextStartTime = let (x, new_currNode) = runNode r currNode in (x, (new_currNode, currStartTime, currMDur, ls))
-    | otherwise = nextNode `seq` nextStartTime `seq` nextMDur `seq` rest `seq`
-      customMap t r (nextNode, nextStartTime, nextMDur, rest)
+  gogo r@(t, _) (!currNode, !currStart, !currDur, nil@[]) = let
+    (x, new_currNode) = if t < currStart + currDur then runNode r currNode else (empt, currNode)
+    in (x, (new_currNode, currStart, currDur, nil))
+  gogo r@(t, _) s@(currNode, !currStart, currDur, ls@((nextNode, !nextStart, nextDur):rest))
+    | t < currStart = (empt, s)
+    | t < nextStart = let (x, new_currNode) = runNode r currNode in (x, (new_currNode, currStart, currDur, ls))
+    | otherwise = nextNode `seq` nextStart `seq` nextDur `seq` rest `seq`
+      gogo r (nextNode, nextStart, nextDur, rest)
 
--- | Given a list @[(node, start, dur)]@, sequence them and let them to play over each other
--- i.e. if the list says @node0@ starts at t=0s and plays for 5s, and @node1@ starts at t=2s
--- and plays for 6s, then both should play together in the interval 2 <= t < 5. Makes use of
--- a function to merge values from simultaneously playing nodes, and an empty value, (so @a@
--- actually just needs to be a @Monoid@ rather than a full @Num@, but it is real annoying to
--- wrap and unwrap the numeric @Sum@ monoid newtype so we'll just expect @Num@, won't hurt.)
+-- | Sequence nodes together polyphonically (i.e. with many voices so that nodes overlapping
+-- is allowed), given their start times and durations. Uses voice allocation to minimize the
+-- number of nodes playing at once. (There's no actual concept of a voice here, but this way
+-- /does/ lead to reduced memory usage and GC because there are fewer nodes happening all at
+-- once being summed up. See `cascade` for more naive and inefficient polyphonic sequencing.
+piecewisePoly :: Num a
+              => TimeVal
+              -- ^the start time for this sequence of nodes
+              -> a -- ^empty value to emit when no nodes are scheduled to be playing
+              -> [(Node a, TimeVal, TimeVal)]
+              -- ^a list of @[(node, start, duration)]@.
+              -> Node a
+piecewisePoly t0 empt = sum . fmap (piecewiseMono t0 empt) . voiceAlloc
+
+-- | A far less efficient way to do `piecewisePoly`, just summing up all the nodes once they
+-- have been individually shifted on the timeline. This implies all nodes are always playing
+-- which can get expensive when e.g. each node is one note.
 cascade :: (Foldable f, Functor f, Num a, Show (f (Node a)))
         => TimeVal -- ^the start time for this sequence of nodes
         -> a -- ^empty value to emit when no nodes are scheduled to be playing
-        -> f (Node a, TimeVal, Maybe TimeVal)
-          -- ^a list of @[(node, start, maybe duration)]@; @node@ starts at @start@ and
-          -- plays for @duration@ if specified, sequenced
+        -> f (Node a, TimeVal, TimeVal) -- ^a list of @[(node, start, duration)]@
         -> Node a
-cascade t0 empt = sum . fmap (\(node, start, mdur) -> startAt empt (t0 + start) mdur node)
+cascade t0 empt = sum . fmap (\(node, sta, du) -> startAt empt (t0 + sta) du node)
 
 -- | A setting for `retriggerWith` determining whether to cut the cell's envelope when we're
 -- at its duration (which is `EnvelopeCutsAtCellDuration`) or let the envelope finish.
@@ -422,51 +431,57 @@ data EnvelopeCellDurationMode = EnvelopeIgnoresCellDuration | EnvelopeCutsAtCell
 data RetriggerMode = RetrigMonophonic | RetrigPolyphonic
   deriving (Eq, Show, Ord)
 
+-- | Render a `Cell` into a `Node` of `LiveCell`. This is where we'd do "effect commands" on
+-- cells by rendering them into a `Node` of time-varying freq/gain/env/pan parameters.
+renderCell :: Cell -> Node LiveCell
+renderCell cell = adsrEnvelope cell.adsr <&> \currEnvValue -> LC
+  { freq = cell.freq
+  , gain = cell.gain
+  , pan = unmaybePan cell.pan
+  , env = currEnvValue
+  }
+
 -- | Play a melody (a list of `Cell`) with a synth (a node parameterized by @`Node` `Freq`@,
 -- @`Node` `Gain`@). Effectively "resets and retriggers" a node in sync with note data. Also
 -- panning will be applied, since a note `Cell`s may specify pan.
-retriggerWith :: EnvelopeCellDurationMode
+retriggerWith :: (Num a)
+              => EnvelopeCellDurationMode
                 -- ^how to treat envelope vs. cell duration, see docs for this type
               -> RetriggerMode -- ^monophonic or polyphonic triggering
               -> TimeVal -- ^a start time for this retriggering sequence
-              -> LR SynthVal -- ^empty value for when notes have concluded
-              -> (Node Freq -> Node Gain -> Node (LR SynthVal))
-                -- ^instrument to retrigger parameterized by frequency & gain
+              -> LR a -- ^empty value for when notes have concluded
+              -> (Node LiveCell -> Node (LR a))
+                -- ^instrument to retrigger. An instrument is parameterized by `LiveCell`s.
               -> [Cell] -- ^note data cells making up the melody
-              -> Node (LR SynthVal)
-retriggerWith envCellDurMode retrigMode t0 empt instrument cells = ff t0 empt nodesDurs
+              -> Node (LR a)
+retriggerWith envCellDurMode retrigMode t0 empt instrument cells = out
   where
-    ff = case retrigMode of
-      RetrigMonophonic -> piecewise
-      RetrigPolyphonic -> cascade
-    doPanning maybePan = stereoize (unmaybePan maybePan) . Right
-    nodesDurs = cells <&> (\cell -> let
-      adsrVals = cell._adsr
-      dur = case envCellDurMode of
-        EnvelopeIgnoresCellDuration -> max (adsrTotalTime adsrVals) cell._dur
-        EnvelopeCutsAtCellDuration -> cell._dur
-      node = (fmap dupLR (adsrEnvelope adsrVals) |*|)
-        $ doPanning cell._pan
-        $ instrument (pure cell._freq) (pure cell._gain)
-      in (node, cell._start, Just dur))
+    out = case retrigMode of
+      RetrigMonophonic -> piecewiseMono t0 empt $ sortOn (\(_, sta, _) -> sta) nodesDurs
+      RetrigPolyphonic -> piecewisePoly t0 empt nodesDurs
+    nodesDurs = cells <&> \cell -> let
+      du = case envCellDurMode of
+        EnvelopeIgnoresCellDuration -> max (adsrTotalTime cell.adsr) cell.dur
+        EnvelopeCutsAtCellDuration -> cell.dur
+      node = instrument $ renderCell cell
+      in (node, cell.start, du)
 
 --------------------------------------------------------------------------------
 -- ** Envelopes
 
 -- | Pure function for `funcRamp`
 _funcRamp_fn :: (Num v, Ord v) => (TimeVal -> v) -> TimeVal -> v -> v -> TimeVal -> v
-_funcRamp_fn f dur start end t = let
-  downramp = start > end
-  smaller = min start end
-  bigger = max start end
-  up = max smaller . min bigger $ smaller + (bigger - smaller) * (f $ t / dur)
+_funcRamp_fn f du sta end t = let
+  downramp = sta > end
+  (!smaller, !bigger) = if downramp then (end, sta) else (sta, end)
+  up = clamp (smaller, bigger) $ smaller + (bigger - smaller) * (f $ t / du)
   in if downramp then smaller + bigger - up else up
 
 -- | A ramp signal that increases from start to end (or possibly decreases) in a given range
 -- of time based on some given function, then holds. For linear ramping, the function should
 -- be \t -> t; For a quadratic ramp, the function is \t -> t*t etc.
 funcRamp :: (Num v, Ord v) => (TimeVal -> v) -> TimeVal -> v -> v -> Node v
-funcRamp f dur start end = if dur == 0 then pure end else nTime <&> _funcRamp_fn f dur start end
+funcRamp f du sta end = if du == 0 then pure end else nTime <&> _funcRamp_fn f du sta end
 
 -- | Specialization of funcRamp to a linear function
 linearRamp :: TimeVal -> SynthVal -> SynthVal -> Node SynthVal
@@ -487,6 +502,11 @@ adsrEnvelope (ADSR v0 tA tD v1 tS tR v2) = let
     | t < t0R -> v1
     | t < tEnd -> v1 + (t - t0R) * dR
     | otherwise -> v2
+
+-- | Convenience shorthand for `adsrEnvelope` on an `ADSR` literal.
+nADSR :: SynthVal -> TimeVal -> TimeVal -> SynthVal -> TimeVal -> TimeVal -> SynthVal -> Node SynthVal
+nADSR v0 tA tD v1 tS tR v2 = adsrEnvelope $ ADSR v0 tA tD v1 tS tR v2
+{-# INLINABLE nADSR #-}
 
 -- | A node-parameterized version of `adsrEnvelope` which can take `ADSRParams` emitted from
 -- a node. Note that this works fairly differently from `adsrEnvelope`: ADSR parameters here
@@ -523,14 +543,15 @@ adsrEnvelopeN = mkNode1 (read "NaN" :: SynthVal, Nothing) . sfr $
 twopi :: SynthVal
 twopi = 2 * pi
 
--- | Shared signal function for sin oscillators.
--- Based on https://juce.com/tutorials/tutorial_sine_synth/
+-- | Shared signal function for sin oscillators, with a phase/angle accumulator as state and
+-- a phase input for phase modulation synthesis.
+-- Sine oscillator based on https://juce.com/tutorials/tutorial_sine_synth/
 _sinOsc_fn :: TimeVal -> Freq -> Gain -> SynthVal -> SynthVal -> (SynthVal, SynthVal)
-_sinOsc_fn d f gain phase myAngle = let
+_sinOsc_fn !d !f !g !phase !myAngleState = let
   angleDelta = f * (d * twopi)
-  newAngle = myAngle + angleDelta
-  newAngleNormed = if newAngle > twopi then newAngle - twopi else newAngle
-  in (gain * sin (myAngle + phase), newAngleNormed)
+  newAngleState' = myAngleState + angleDelta
+  newAngleState = if newAngleState' > twopi then newAngleState' - twopi else newAngleState'
+  in (g * sin (myAngleState + phase), newAngleState)
 {-# INLINE _sinOsc_fn #-}
 
 _sinOsc_s0 :: SynthVal
@@ -538,11 +559,11 @@ _sinOsc_s0 = 0.0
 {-# INLINE _sinOsc_s0 #-}
 
 _sinOsc_SF :: SF (Freq, Gain) SynthVal SynthVal
-_sinOsc_SF = sfr $ \(_, d) (f, gain) myAngle -> _sinOsc_fn d f gain 0 myAngle
+_sinOsc_SF = sfr $ \(_, d) (f, g) -> _sinOsc_fn d f g 0
 {-# INLINE _sinOsc_SF #-}
 
 _sinOscP_SF :: SF (SynthVal, Freq, Gain) SynthVal SynthVal
-_sinOscP_SF = sfr $ \(_, d) (phase, f, gain) myAngle -> _sinOsc_fn d f gain phase myAngle
+_sinOscP_SF = sfr $ \(_, d) (phase, f, g) -> _sinOsc_fn d f g phase
 {-# INLINE _sinOscP_SF #-}
 
 -- | Sine oscillator, holding state for the current angle.
