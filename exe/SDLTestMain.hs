@@ -73,9 +73,9 @@ testSynth0 lc = finalNode
 testSynth1 :: Node LiveCell -> Node (LR SynthVal)
 testSynth1 lc = finalNode
   where
-    f = lc <&> (.freq)
+    f = cache $ lc <&> (.freq)
     g = lc <&> (.gain)
-    e = lc <&> (.env) -- note envelope current value
+    e = cache $ lc <&> (.env) -- note envelope current value
     -- pan = lc <&> (.pan)
     sinModulator3 = adsrEnvelope (ADSR 0.0 0.02 0.0 1.0 0.02 0.01 1.0) * sinOsc (5 *| f) e
     fWithVibrato = (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
@@ -85,9 +85,9 @@ testSynth1 lc = finalNode
 testSynth2 :: Node LiveCell -> Node (LR SynthVal)
 testSynth2 lc = finalNode
   where
-    f = lc <&> (.freq)
-    g = lc <&> (.gain)
-    e = lc <&> (.env) -- note envelope current value
+    f = cache $ lc <&> (.freq)
+    g = cache $ lc <&> (.gain)
+    e = cache $ lc <&> (.env) -- note envelope current value
     sinModulator1 = e * nADSR 0.1 0.04 0.0 1.0 0.05 0.01 1.0 * sinOsc (5 *| f) 0.7
     -- also apply a pitch envelope on top of vibrato
     fWithVibrato = nADSR 0.0 0.01 0.0 1.0 0.05 0.01 1.0 * (f * (1 +| sinOsc 5 0.02))

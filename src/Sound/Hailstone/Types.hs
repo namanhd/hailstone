@@ -1,3 +1,4 @@
+{-# LANGUAGE Strict #-}
 {-# LANGUAGE OverloadedRecordDot, DuplicateRecordFields, BangPatterns #-}
 
 module Sound.Hailstone.Types

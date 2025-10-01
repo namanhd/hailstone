@@ -1,3 +1,4 @@
+{-# LANGUAGE Strict #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE BangPatterns, MultiWayIf, OverloadedRecordDot, DuplicateRecordFields #-}
 
@@ -9,9 +10,15 @@ module Sound.Hailstone.Synth
   -- emitted values are fed into the parent, forming a tree of nodes. Check the constructors
   -- for the minimal set of axiomatic nodes that cover our evaluation needs; check `mkNode1`
   -- `mkNode3` for some derived constructors with other arities.
+  --
+  -- The audio node /tree/ can become an audio node /graph/ (a DAG, to be specific) with the
+  -- use of `cache`, which uses sorcery to enable /observable sharing/, letting the embedded
+  -- DSL see the sharing semantics, the let-bindings & usage of names, of the host language.
   Node(..)
   -- *** Convenient derived constructors
 , mkNode1, mkNode3
+  -- ** Observable sharing
+, cache
   -- ** Consuming nodes at the audio backend
 , Sink(..), initSink, runNode, iterateNode
   -- ** Basic operators
@@ -24,17 +31,12 @@ module Sound.Hailstone.Synth
 , EnvelopeCellDurationMode(..), RetriggerMode(..)
 , retriggerWith
   -- ** Envelopes
-, ADSRParams(..)
-, mkADSRez
 , adsrEnvelope, adsrEnvelopeN, nADSR
 , funcRamp, linearRamp
   -- ** Generators
 , sinOsc, sinOscP
   -- * Re-exports
-, SynthVal, Freq, Gain, Pan, SampleRate, TimeVal, SampleVal
-, ChanMode(..)
-, Cell(..), LiveCell(..)
-, LR(..)
+, module Sound.Hailstone.Types
 )
 where
 
@@ -45,6 +47,10 @@ import Control.Monad.Reader
 import Control.Monad.State.Strict
 import Sound.Hailstone.Types
 import Sound.Hailstone.VoiceAlloc (voiceAlloc)
+
+-- dark magic for observable sharing
+import System.IO.Unsafe (unsafePerformIO)
+import Data.IORef (newIORef, readIORef, writeIORef)
 
 --------------------------------------------------------------------------------
 -- * Signal functions
@@ -90,7 +96,7 @@ sfr !f = ask >>= \(!r, !a) -> state $ f r a
 
 {-|
 Audio Node tree; each node packs a state (of whatever state type @s@) together with a signal
-function' that can operate on that state to emit a value and a new state.  (The constructors
+function that can operate on that state to emit a value and a new state. (These constructors
 are for different arity cases. We only need up to 2, then arities higher than two are easily
 decomposed into binary functions). As a result, this is a mostly applicative interface, with
 a natural applicative instance. (Show s currently used for debugging; can remove this later)
@@ -100,8 +106,8 @@ There are a number of design decisions here...
     - A: While it's true that you can write an Applicative instance such that any n-ary func
       can just be represented as a MkNode0 that emits that function applied to other MkNode0
       that emit arguments, such a function will __not__ be able to modify the state based on
-      these arguments. (i.e. the function is confined to the "pure slot" of the applicative,
-      and cannot "reach outwards" and affect the node state, a necessity for modeling e.g. a
+      these arguments. (i.e. the function is confined to the applicative's \"pure slot\" and
+      cannot \"reach outwards\" and affect the node state, a necessity for modeling e.g. the
       sine oscillator carrying an angle state (which must update node state based on emitted
       frequency values from an argument node.)
 - Q: Why do we need `MkNode2`? Why not @MkNode1@, since the @a@ in @`SF` a s x@ could be any
@@ -115,29 +121,31 @@ There are a number of design decisions here...
       out to need the (<*>) we were trying to write in the first place, or needs to be hard-
       coded, which does not feel quite right. (Maybe there is a good way to use just MkNode1
       though, I haven't thought everything through.)
+- Q: This is a binary tree... One usually hears of audio graphs, not audio node trees. Is it
+  possible to represent audio node graphs i.e. forking a node output to feed multiple nodes?
+    - A: With some cursed magic to implement __observable sharing__ in `cache`, yes. That is
+      the general way to hijack the host language's sharing and make it manifest in the eDSL
+      embedded within it, without having to make the DSL type a monad (which we don't have).
 -}
 data Node x where
+  MkNodeConst :: x -> Node x
+  -- ^constant node of a pure value. can be done with just `MkNode0`, but having a dedicated
+  -- constructor for this common case should be more efficient (no dummy state, no SF, etc.)
   MkNode0 :: (Show s) => !s -> !(SF () s x) -> Node x
-  -- ^nullary node, representing a source of values with no arguments needed.
+  -- ^nullary node, representing a stateful source of values with no arguments needed.
   MkNode2 :: (Show s) => !s -> !(SF (f, a) s x) -> !(Node f) -> !(Node a) -> Node x
   -- ^binary node. can represent any time-varying computation taking two argument nodes, but
   -- can also be used to lift, into a node, via the applicative instance, the application of
   -- a pure function @f@ to a pure argument @a@.
 
-  -- TODO: implement Let and Var nodes for reusing computed samples (this is on the way to
-  -- 'observable sharing' for DSLs to hijack the host language's let mechanisms to get
-  -- sharing for itself, but it's black magic, not sure if I want to do that, esp. since
-  -- i'll be writing the user-facing language separately too, which will need Let and Var in any case)
-  -- https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md
-
-
 instance Functor Node where
+  fmap f (MkNodeConst !x) = MkNodeConst (f x)
   fmap f (MkNode0 !s !sig) = MkNode0 s (fmap f sig)
   fmap f (MkNode2 !s !sig !aNode !bNode) = MkNode2 s (fmap f sig) aNode bNode
 
 instance Applicative Node where
-  pure = MkNode0 () . pure
-  {-# INLINABLE pure #-}
+  pure = MkNodeConst
+  {-# INLINE pure #-}
   liftA2 !f !aNode !bNode = MkNode2 () (sfArgs >>= \(!a, !b) -> pure (f a b)) aNode bNode
   {-# INLINABLE liftA2 #-}
   !fNode <*> !xNode = MkNode2 () (sfArgs >>= \(!f, !x) -> pure (f x)) fNode xNode
@@ -152,6 +160,7 @@ instance Show (Node x) where
     editShowNode str = if str == "()" then "_" else "(" <> str <> ")"
     showBinNode aNode bNode = editShowNode (show aNode) <> " " <> editShowNode (show bNode)
     in case node of
+      (MkNodeConst _) -> "NC"
       (MkNode0 s _) -> let str = "N0 " <> showState s in if str == "N0 {}" then "" else str
       (MkNode2 s _ aNode bNode) -> "N2 " <> showState s <> " " <> showBinNode aNode bNode
 
@@ -202,6 +211,50 @@ mkNode1 s sig node = MkNode2 s (sfr $ \r (a, _) -> runSF sig r a) node (pure ())
 mkNode3 :: Show s => s -> SF (a, b, c) s x -> Node a -> Node b -> Node c -> Node x
 mkNode3 s sig aNode bNode = MkNode2 s (sfr $ \r ((a, b), c) -> runSF sig r (a, b, c))
   $ liftA2 (,) aNode bNode
+{-# INLINABLE mkNode3 #-}
+
+--------------------------------------------------------------------------------
+-- ** Observable sharing
+
+-- | Uses `unsafePerformIO` to allow a node to cache its output, keyed by (time, deltaTime).
+-- If a cache-supporting node is run with a new time & deltaTime /different/ from the time &
+-- deltaTime associated with the cached value, the cache is cleared & refreshed with a value
+-- computed from the signal function. This gives /observable sharing/: let-binding a caching
+-- node, and using that bound name as the child of other nodes, lets those nodes effectively
+-- use the same cached result, which would thusly be only ever calculated upon its first use
+-- exactly once every new sampling step (i.e. on every new value of the signal environment).
+--
+-- BEWARE: @show@ will be unable to accurately display \"trees\" with such \"shared\" nodes!
+-- Use sites of a shared node will print as a node with the __wrong__ state, since they were
+-- always "the same (haskell) evaluation graph node" for sample-calc purposes right up until
+-- their state became explicitly needed for printing at which point they are finally init'd.
+--
+-- CAVEAT: this has a bit of overhead (`unsafePerformIO` and the `IORef` both incur a cost),
+-- though it will be beneficial for most nontrivial nodes and especially ones that are piped
+-- into many other nodes as arguments. Do profiling to inform judgment of whether `cache` is
+-- helping or not, because it can be non-obvious.
+--
+-- See [reactive-banana's writeup](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md)
+-- and [implementation](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/src/Reactive/Banana/Prim/High/Cached.hs)
+-- of this approach (observable sharing had been described in papers prior.)
+cache :: Node x -> Node x
+cache me@(MkNodeConst _) = me
+cache node = unsafePerformIO $ newIORef Nothing <&> \ref -> case node of
+  MkNode0 s sig -> MkNode0 s . sfr $ \r _ s' -> let
+    -- we rely on runit being lazy so that we write the ref only when the cache misses
+    ~runit = let (x, new_s) = runSF sig r () s' in
+      x `seq` new_s `seq` writeIORef ref (Just (r, x)) *> pure (x, new_s)
+    in unsafePerformIO $ readIORef ref >>= \cached -> case cached of
+      Just (rc, xc) -> if rc == r then pure (xc, s') else runit
+      Nothing -> runit
+  MkNode2 s sig aNode bNode -> MkNode2 s (sfr $ \r ar s' -> let
+    ~runit = let (x, new_s) = runSF sig r ar s' in
+      x `seq` new_s `seq` writeIORef ref (Just (r, x)) *> pure (x, new_s)
+    in unsafePerformIO $ readIORef ref >>= \cached -> case cached of
+      Just (rc, xc) -> if rc == r then pure (xc, s') else runit
+      Nothing -> runit
+    ) aNode bNode
+{-# NOINLINE cache #-}
 
 --------------------------------------------------------------------------------
 -- ** Consuming nodes at the audio backend
@@ -214,13 +267,14 @@ runNode :: SigEnv -> Node x -> (x, Node x)
 runNode !r = go
   where
     go :: Node x -> (x, Node x)
-    go (MkNode0 !s !sig) = let
-      (!x, !new_s) = runSF sig r () s in x `seq` new_s `seq` (x, MkNode0 new_s sig)
-    go (MkNode2 !s !sig !aNode !bNode) = let
-      (!a, !new_aNode) = aNode `seq` go aNode
-      (!b, !new_bNode) = bNode `seq` go bNode
-      (!x, !new_s) = a `seq` b `seq` runSF sig r (a, b) s
-      in x `seq` new_aNode `seq` new_bNode `seq`
+    go me@(MkNodeConst x) = x `seq` (x, me)
+    go (MkNode0 s sig) = let
+      (x, new_s) = runSF sig r () s in x `seq` new_s `seq` (x, MkNode0 new_s sig)
+    go (MkNode2 s sig aNode bNode) = let
+      (a, new_aNode) = aNode `seq` go aNode
+      (b, new_bNode) = bNode `seq` go bNode
+      (x, new_s) = a `seq` b `seq` runSF sig r (a, b) s
+      in x `seq` new_s `seq` new_aNode `seq` new_bNode `seq`
         (x, MkNode2 new_s sig new_aNode new_bNode)
 
 -- | Queries a node @n@ times given the signal environment and a `SigEnv`-stepping function.
@@ -270,7 +324,7 @@ tick sta = mkNode1 sta $ sfArgs >>= \i -> state $ \s -> (s, s + i)
 -- __stepper :: SigEnv -> SigEnv
 -- __stepper = (\(t, d) -> (t + d, d))
 
--- __testApplic = iterateNode __testenv id 3 $ (\a b c -> a + b + c) <$> (tick 1 1) <*> (tick 2 1) <*> (tick 3 1)
+-- __testApplic = let ticker = cache $ tick 1 1 in iterateNode __testenv __stepper 3 $ (\a b c -> a + b + c) <$> ticker <*> ticker <*> ticker
 -- __testPiecewise = iterateNode __testenv __stepper 14 $
 --   startAt (-1) 2.0 (Just 5) $ piecewise 1.0 0 [(tick 10 1, 3), (tick 20 1, 2), (tick 30 1, 4)]
 
@@ -314,7 +368,9 @@ modifyTime f df node = case node of
   (MkNode0 s sig) -> MkNode0 s (sfModifyTime f df sig)
   -- must recursively modify time for the child nodes too since our signal function concerns
   -- only ourselves; the child nodes are evaluated before we are.
+  -- TODO a bool on child nodes to enable/disable modifyTime recurse?
   (MkNode2 s sig aNode bNode) -> MkNode2 s (sfModifyTime f df sig) (modifyTime f df aNode) (modifyTime f df bNode)
+  constNode -> constNode
   where
     sfModifyTime :: (TimeVal -> TimeVal) -> (TimeVal -> TimeVal) -> SF a s x -> SF a s x
     sfModifyTime g dg = local (\((t, d), ar) -> ((g t, dg d), ar))
@@ -431,10 +487,10 @@ data EnvelopeCellDurationMode = EnvelopeIgnoresCellDuration | EnvelopeCutsAtCell
 data RetriggerMode = RetrigMonophonic | RetrigPolyphonic
   deriving (Eq, Show, Ord)
 
--- | Render a `Cell` into a `Node` of `LiveCell`. This is where we'd do "effect commands" on
--- cells by rendering them into a `Node` of time-varying freq/gain/env/pan parameters.
+-- | Render a `Cell` into a `Node` of `LiveCell`. This is where we'll do \"effect commands\"
+-- on cells by rendering them into a `Node` of time-varying freq/gain/env/pan parameters.
 renderCell :: Cell -> Node LiveCell
-renderCell cell = adsrEnvelope cell.adsr <&> \currEnvValue -> LC
+renderCell cell = cache $ adsrEnvelope cell.adsr <&> \currEnvValue -> LC
   { freq = cell.freq
   , gain = cell.gain
   , pan = unmaybePan cell.pan
@@ -442,8 +498,7 @@ renderCell cell = adsrEnvelope cell.adsr <&> \currEnvValue -> LC
   }
 
 -- | Play a melody (a list of `Cell`) with a synth (a node parameterized by @`Node` `Freq`@,
--- @`Node` `Gain`@). Effectively "resets and retriggers" a node in sync with note data. Also
--- panning will be applied, since a note `Cell`s may specify pan.
+-- @`Node` `Gain`@). Effectively \"resets and retriggers\" a node in sync with note data.
 retriggerWith :: (Num a)
               => EnvelopeCellDurationMode
                 -- ^how to treat envelope vs. cell duration, see docs for this type
@@ -458,7 +513,7 @@ retriggerWith envCellDurMode retrigMode t0 empt instrument cells = out
   where
     out = case retrigMode of
       RetrigMonophonic -> piecewiseMono t0 empt $ sortOn (\(_, sta, _) -> sta) nodesDurs
-      RetrigPolyphonic -> piecewisePoly t0 empt nodesDurs
+      RetrigPolyphonic -> cache $ piecewisePoly t0 empt nodesDurs
     nodesDurs = cells <&> \cell -> let
       du = case envCellDurMode of
         EnvelopeIgnoresCellDuration -> max (adsrTotalTime cell.adsr) cell.dur
@@ -496,7 +551,7 @@ adsrEnvelope (ADSR v0 tA tD v1 tS tR v2) = let
   !t0R = t0S + tS
   !dR = (v2 - v1) / tR
   !tEnd = t0R + tR
-  in MkNode0 () . (sfTime <&>) $ \t -> if
+  in cache $ MkNode0 () $ sfTime <&> \t -> if
     | t < tA -> v0 + t * dA
     | t < t0S -> 1.0 + (t - tA) * dD
     | t < t0R -> v1
@@ -543,15 +598,32 @@ adsrEnvelopeN = mkNode1 (read "NaN" :: SynthVal, Nothing) . sfr $
 twopi :: SynthVal
 twopi = 2 * pi
 
+-- invtwopi :: SynthVal
+-- invtwopi = recip twopi
+
+-- _tblsz :: Int
+-- _tblsz = 256
+-- {-# INLINE _tblsz #-}
+
+-- _tblszf :: SynthVal
+-- _tblszf = fromIntegral _tblsz
+-- {-# INLINE _tblszf #-}
+
+-- _tblSin :: VU.Vector SynthVal
+-- _tblSin = VU.generate _tblsz (sin . (* (twopi / _tblszf)) . fromIntegral)
+
 -- | Shared signal function for sin oscillators, with a phase/angle accumulator as state and
 -- a phase input for phase modulation synthesis.
 -- Sine oscillator based on https://juce.com/tutorials/tutorial_sine_synth/
 _sinOsc_fn :: TimeVal -> Freq -> Gain -> SynthVal -> SynthVal -> (SynthVal, SynthVal)
 _sinOsc_fn !d !f !g !phase !myAngleState = let
-  angleDelta = f * (d * twopi)
+  angleDelta = f * d
   newAngleState' = myAngleState + angleDelta
-  newAngleState = if newAngleState' > twopi then newAngleState' - twopi else newAngleState'
-  in (g * sin (myAngleState + phase), newAngleState)
+  newAngleState = if newAngleState' > 1 then newAngleState' - 1 else newAngleState'
+  -- tblSinIdx = round (_tblszf * (newAngleState + phase * invtwopi)) `mod` _tblsz
+  -- in (g * (_tblSin VU.! tblSinIdx), newAngleState)
+  -- using a sin wavetable doesn't actually save that much?
+  in (g * sin (twopi * newAngleState + phase), newAngleState)
 {-# INLINE _sinOsc_fn #-}
 
 _sinOsc_s0 :: SynthVal
