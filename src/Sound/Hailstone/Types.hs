@@ -30,6 +30,9 @@ type SynthVal = Double
 -- | Frequency value type in Hz; must be positive.
 type Freq = SynthVal
 
+-- | Interval type, given as cents
+type Cents = SynthVal
+
 -- | Gain/amplitude as a scale factor; normally between -1 and 1 when creating
 -- signals that go to the speakers but for modulators this can just be anything.
 type Gain = SynthVal
@@ -55,11 +58,11 @@ type TimeVal = SynthVal
 type SampleVal = Int16
 
 -- | Note data cell; stores some basic playing properties of a note.
-data Cell = Cell
-  { freq :: !Freq -- ^Frequency of the note
-  , gain :: !Gain -- ^Gain of the note as a linear multiplier (should be between 0 and 1)
-  , start :: !TimeVal -- ^Start time of the note in seconds.
-  , dur :: !TimeVal
+data Cell = MkC
+  { freq :: {-# UNPACK #-} !Freq -- ^Frequency of the note
+  , gain :: {-# UNPACK #-} !Gain -- ^Gain of the note as a linear multiplier (should be between 0 and 1)
+  , start :: {-# UNPACK #-} !TimeVal -- ^Start time of the note in seconds.
+  , dur :: {-# UNPACK #-} !TimeVal
   -- ^Duration of the note in seconds, which needs not equal the `adsrTotalTime` of `_adsr`;
   -- this will, however, be the duration after which the cell is hard cut off.
   , pan :: !(Maybe Pan)
@@ -77,7 +80,7 @@ data Cell = Cell
 -- is reflected as time-varying `LiveCell`s emitted to the instrument upon every new sample.
 -- There may be more metadata here such as arbitrary modulation values that can be mapped to
 -- any parameter in the instrument, like ModX & ModY on notes wrt. FL Studio native plugins.
-data LiveCell = LC
+data LiveCell = MkLC
   { freq :: !Freq -- ^ current frequency
   , gain :: !Gain -- ^ current gain
   , pan :: !Pan -- ^ current pan

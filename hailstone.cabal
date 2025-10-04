@@ -11,28 +11,28 @@ copyright:           2021 namanh
 category:            Sound
 build-type:          Simple
 cabal-version:       >=1.10
-extra-source-files:  README.md
+-- extra-source-files:  README.md
 
 library
   hs-source-dirs:    src
-  ghc-options:       -Wall -O3 -threaded -rtsopts
+  ghc-options:       -Wall -O3 -threaded
   default-language:  Haskell2010
   exposed-modules:   Sound.Hailstone.Synth
                    , Sound.Hailstone.Types
                    , Sound.Hailstone.VoiceAlloc
   build-depends:     base >= 4.7 && < 5
-                   , mtl
 
 executable hailstone-sdltest
   hs-source-dirs:      exe
   main-is:             SDLTestMain.hs
   other-modules:       Sound.Hailstone.Backends.SDLAudio
   -- use the SDL audio backend
-  ghc-options:         -Wall -O3 -threaded -rtsopts
+  ghc-options:         -Wall -O3 -threaded -rtsopts -with-rtsopts "-N -maxN4 -H16m"
   -- note that -threaded is required for anything that FFIs to SDL2, otherwise
   -- it will segfault/crash horribly!
   default-language:    Haskell2010
   build-depends:       base >= 4.7 && < 5
                      , hailstone
                      , vector
+                     , unagi-chan
                      , sdl2

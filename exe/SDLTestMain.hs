@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedRecordDot, Strict #-}
 -- Test main executable, for trying out songs and synths
 
 module Main where
@@ -14,13 +14,13 @@ testSong = let
   du = 0.5
   myAdsr = ADSR 0.9 0.01 0.0 0.9 0.1 0.2 0.0
   in (\cc -> cc du nop myAdsr) <$>
-  [ Cell 440 0.25 0.0
-  , Cell 550 0.25 0.5
-  , Cell 660 0.25 1.0
-  , Cell 660 0.00 1.5
-  , Cell 660 0.25 2.0
-  , Cell 550 0.25 2.5
-  , Cell 440 0.25 3.0
+  [ MkC 440 0.25 0.0
+  , MkC 550 0.25 0.5
+  , MkC 660 0.25 1.0
+  , MkC 660 0.00 1.5
+  , MkC 660 0.25 2.0
+  , MkC 550 0.25 2.5
+  , MkC 440 0.25 3.0
   ]
 
 testSong2 :: [Cell]
@@ -37,29 +37,29 @@ testSong2 = let
   maj3 = ((5/4) *)
   r = 220
   in (\cc -> cc sxthlen nop myAdsr) <$>
-  [ Cell r 0.4 (b 0)
-  , Cell (maj7 r) 0.25 (b 2), Cell (maj10 r) 0.25 (b 2)
-  , Cell r 0.4 (b 3)
-  , Cell (downp5 r) 0.4 (b 4)
-  , Cell (maj3 r) 0.25 (b 5), Cell (maj7 r) 0.25 (b 5), Cell (maj10 r) 0.25 (b 5)
-  , Cell (downp4 r) 0.4 (b 7)
-  , Cell r 0.4 (b 8)
-  , Cell (maj10 r) 0.25 (b 9), Cell (maj7 r) 0.25 (b 9)
-  , Cell r 0.4 (b 11)
-  , Cell (0.5 * r) 0.4 (b 12), Cell (maj10 r) 0.25 (b 12), Cell (p5 r) 0.25 (b 12)
+  [ MkC r 0.4 (b 0)
+  , MkC (maj7 r) 0.25 (b 2), MkC (maj10 r) 0.25 (b 2)
+  , MkC r 0.4 (b 3)
+  , MkC (downp5 r) 0.4 (b 4)
+  , MkC (maj3 r) 0.25 (b 5), MkC (maj7 r) 0.25 (b 5), MkC (maj10 r) 0.25 (b 5)
+  , MkC (downp4 r) 0.4 (b 7)
+  , MkC r 0.4 (b 8)
+  , MkC (maj10 r) 0.25 (b 9), MkC (maj7 r) 0.25 (b 9)
+  , MkC r 0.4 (b 11)
+  , MkC (0.5 * r) 0.4 (b 12), MkC (maj10 r) 0.25 (b 12), MkC (p5 r) 0.25 (b 12)
 
-  , Cell r 0.1 (b 14)
-  , Cell (9/8 * r) 0.12 (b 14.5)
-  , Cell (6/5 * r) 0.15 (b 15)
-  , Cell (5/4 * r) 0.2 (b 15.5)
-  , Cell (3/2 * r) 0.22 (b 16)
-  , Cell (10/6 * r) 0.25 (b 16.5)
-  , Cell (2 * r) 0.3 (b 17)
+  , MkC r 0.1 (b 14)
+  , MkC (9/8 * r) 0.12 (b 14.5)
+  , MkC (6/5 * r) 0.15 (b 15)
+  , MkC (5/4 * r) 0.2 (b 15.5)
+  , MkC (3/2 * r) 0.22 (b 16)
+  , MkC (10/6 * r) 0.25 (b 16.5)
+  , MkC (2 * r) 0.3 (b 17)
   ]
 
--- | shorthand constructor for `Cell`
+-- | shorthand constructor for `MkC`
 n :: Freq -> Gain -> TimeVal -> TimeVal -> Maybe Pan -> ADSRParams -> Cell
-n = Cell
+n = MkC
 
 testSynth0 :: Node LiveCell -> Node (LR SynthVal)
 testSynth0 lc = finalNode
@@ -100,25 +100,33 @@ testSynth2 lc = finalNode
 tonetestmainSDL :: IO ()
 tonetestmainSDL = do
   let sampleRate = 44100
-      bufferSize = 8192
+      bufferSize = 256
       chanMode = Stereo
-  putStrLn "Opening audio"
-  (audioDevice, mSink) <- openAudio sampleRate bufferSize chanMode
+
   putStrLn "Making song sample stream"
   let
+    sec = 1000000
     playNotes synth notes = retriggerWith
       EnvelopeIgnoresCellDuration RetrigPolyphonic 0.0 0.0 synth notes
     summedNode = playNotes testSynth2 testSong2
     destNode = asPCM summedNode
 
-  putNode mSink destNode
-  enableAudio audioDevice
+  putStrLn "Opening audio"
+  hah <- openAudio sampleRate bufferSize chanMode destNode
+
+  -- -- can replace node with
+  -- putNode hah newDestNode
+
+  putStrLn "Waiting before play start"
+  threadDelay (round $ 0.5 * sec)
   putStrLn "Starting play"
+  enableAudio hah
+
   let runDuration = 3.5 :: TimeVal
-  threadDelay (round $ runDuration * 1000000)
+  threadDelay (round $ runDuration * sec)
 
   putStrLn "Done waiting"
-  closeAudio audioDevice
+  closeAudio hah
   pure ()
 
 main :: IO ()
