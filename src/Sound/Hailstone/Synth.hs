@@ -105,7 +105,7 @@ There are a number of design decisions here...
       embedded within it, without having to make the DSL type a monad (which we don't have).
 -}
 data Node x where
-  MkNodeConst :: x -> Node x
+  MkNodeConst :: !x -> Node x
   -- ^constant node of a pure value. can be done with just `MkNode0`, but having a dedicated
   -- constructor for this common case should be more efficient (no dummy state, no SF, etc.)
   MkNode0 :: (Show s) => !s -> !(SF () s x) -> Node x
@@ -116,16 +116,18 @@ data Node x where
   -- a pure function @f@ to a pure argument @a@.
 
 instance Functor Node where
-  fmap f (MkNodeConst !x) = MkNodeConst (f x)
-  fmap f (MkNode0 !s !sig) = MkNode0 s (\r a s' -> let (x, s'') = sig r a s' in (f x, s''))
-  fmap f (MkNode2 !s !sig !aNode !bNode) = MkNode2 s (\r a s' -> let (x, s'') = sig r a s' in (f x, s'')) aNode bNode
+  fmap f (MkNodeConst x) = MkNodeConst (f x)
+  fmap f (MkNode0 s sig) = MkNode0 s
+    (\r a s' -> let (!x, !s'') = sig r a s' in (f x, s''))
+  fmap f (MkNode2 s sig aNode bNode) = MkNode2 s
+    (\r a s' -> let (!x, !s'') = sig r a s' in (f x, s'')) aNode bNode
 
 instance Applicative Node where
   pure = MkNodeConst
   {-# INLINE pure #-}
-  liftA2 !f !aNode !bNode = MkNode2 () (\_ (!a, !b) s -> (f a b, s)) aNode bNode
+  liftA2 f aNode bNode = MkNode2 () (\_ (!a, !b) s -> (f a b, s)) aNode bNode
   {-# INLINABLE liftA2 #-}
-  !fNode <*> !xNode = MkNode2 () (\_ (!f, !x) s -> (f x, s)) fNode xNode
+  fNode <*> xNode = MkNode2 () (\_ (!f, !x) s -> (f x, s)) fNode xNode
   {-# INLINABLE (<*>) #-}
 
 showState :: (Show s) => s -> String
@@ -142,7 +144,6 @@ instance Show (Node x) where
       (MkNode2 s _ aNode bNode) -> "N2 " <> showState s <> " " <> showBinNode aNode bNode
 
 instance (Num a) => Num (Node a) where
-  -- these two we use our own functions with inline annotations
   (+) = (|+|)
   {-# INLINABLE (+) #-}
   (*) = (|*|)
@@ -180,13 +181,13 @@ instance (Floating a) => Floating (Node a) where
 
 -- | Constructor for a unary node, derived from `MkNode2`.
 mkNode1 :: Show s => s -> SF a s x -> Node a -> Node x
-mkNode1 s sig node = MkNode2 s (\r (a, _) -> sig r a) node (pure ())
+mkNode1 s sig node = MkNode2 s (\r (!a, _) -> sig r a) node (pure ())
 {-# INLINABLE mkNode1 #-}
 
 -- | Constructor for a ternary node, derived from `MkNode2`. (This pattern of tupling up arg
 -- nodes can be extended indefinitely to higher arities if we ever need them.)
 mkNode3 :: Show s => s -> SF (a, b, c) s x -> Node a -> Node b -> Node c -> Node x
-mkNode3 s sig aNode bNode = MkNode2 s (\r ((a, b), c) -> sig r (a, b, c))
+mkNode3 s sig aNode bNode = MkNode2 s (\r ((!a, !b), !c) -> sig r (a, b, c))
   $ liftA2 (,) aNode bNode
 {-# INLINABLE mkNode3 #-}
 
@@ -219,16 +220,14 @@ cache me@(MkNodeConst _) = me
 cache node = unsafePerformIO $ newIORef Nothing <&> \ref -> case node of
   MkNode0 s sig -> MkNode0 s $ \r _ s' -> let
     -- we rely on runit being lazy so that we write the ref only when the cache misses
-    ~runit = let (x, new_s) = sig r () s' in
-      x `seq` new_s `seq` writeIORef ref (Just (r, x)) *> pure (x, new_s)
+    ~runit = let (!x, !new_s) = sig r () s' in writeIORef ref (Just (r, x)) *> pure (x, new_s)
     in unsafePerformIO $ readIORef ref >>= \cached -> case cached of
-      Just (rc, xc) -> if rc == r then pure (xc, s') else runit
+      Just (!rc, !xc) -> if rc == r then pure (xc, s') else runit
       Nothing -> runit
   MkNode2 s sig aNode bNode -> MkNode2 s (\r ar s' -> let
-    ~runit = let (x, new_s) = sig r ar s' in
-      x `seq` new_s `seq` writeIORef ref (Just (r, x)) *> pure (x, new_s)
+    ~runit = let (!x, !new_s) = sig r ar s' in writeIORef ref (Just (r, x)) *> pure (x, new_s)
     in unsafePerformIO $ readIORef ref >>= \cached -> case cached of
-      Just (rc, xc) -> if rc == r then pure (xc, s') else runit
+      Just (!rc, !xc) -> if rc == r then pure (xc, s') else runit
       Nothing -> runit
     ) aNode bNode
 {-# NOINLINE cache #-}
@@ -241,18 +240,17 @@ cache node = unsafePerformIO $ newIORef Nothing <&> \ref -> case node of
 -- that profiling indicates that we are truly licensed to have a ton of seqs & bang patterns
 -- which provide a great and measurable benefit in reducing thunks, allocations & GC stops.)
 runNode :: SigEnv -> Node x -> (x, Node x)
-runNode !r = go
+runNode r = go
   where
     go :: Node x -> (x, Node x)
-    go me@(MkNodeConst x) = x `seq` (x, me)
+    go me@(MkNodeConst !x) = (x, me)
     go (MkNode0 s sig) = let
-      (x, new_s) = sig r () s in x `seq` new_s `seq` (x, MkNode0 new_s sig)
+      (!x, !new_s) = sig r () s in (x, MkNode0 new_s sig)
     go (MkNode2 s sig aNode bNode) = let
-      (a, new_aNode) = aNode `seq` go aNode
-      (b, new_bNode) = bNode `seq` go bNode
-      (x, new_s) = a `seq` b `seq` sig r (a, b) s
-      in x `seq` new_s `seq` new_aNode `seq` new_bNode `seq`
-        (x, MkNode2 new_s sig new_aNode new_bNode)
+      (!a, !new_aNode) = go aNode
+      (!b, !new_bNode) = go bNode
+      (!x, !new_s) = sig r (a, b) s
+      in (x, MkNode2 new_s sig new_aNode new_bNode)
 
 -- | Queries a node @n@ times given the signal environment and a `SigEnv`-stepping function.
 -- This gives a very simple way to sample the node tree and produce an array of samples, but
@@ -303,7 +301,7 @@ tick sta = mkNode1 sta $ \_ i s -> (s, s + i)  --  sfArgs >>= \i -> state $ \s -
 
 -- | Retrieve the time tick context from the signal environment, as a node.
 nTime :: Node TimeVal
-nTime = MkNode0 () $ \(t, _) _ s -> (t, s)
+nTime = MkNode0 () $ \(!t, _) _ s -> (t, s)
 {-# INLINABLE nTime #-}
 
 -- | Mix two nodes with addition.
@@ -346,12 +344,12 @@ modifyTime f df node = case node of
   constNode -> constNode
   where
     sfModifyTime :: (TimeVal -> TimeVal) -> (TimeVal -> TimeVal) -> SF a s x -> SF a s x
-    sfModifyTime g dg sig (t, d) = sig (g t, dg d)
+    sfModifyTime g dg sig (!t, !d) = sig (g t, dg d)
 
 -- | Have a node start emitting at a start time (and possibly end after some duration), else
 -- emitting a default empty value outside the allowed timespan.
 startAt :: a -> TimeVal -> TimeVal -> Node a -> Node a
-startAt empt sta du node' = MkNode0 (modifyTime (subtract sta) id node') $ \r@(!t, _) _ !node -> if
+startAt empt sta du node' = MkNode0 (modifyTime (subtract sta) id node') $ \r@(!t, _) _ node -> if
   | t < sta -> (empt, node)
   | t < (sta + du) -> runNode r node
   | otherwise -> (empt, node)
@@ -375,17 +373,22 @@ asPCM = roundClip . (*|) (fromIntegral (maxBound :: SampleVal))
 -- is centered, and 1.0 is hard right.  (Though, no bounds checking is done to ensure this.)
 -- See `stereoize` for a version where the pan value can be emitted from an argument `Node`.
 stereoize :: (Num a) => a -> Either (Node a) (Node (LR a)) -> Node (LR a)
-stereoize p (Left monoNode) = fmap (\a -> MkLR (((1 - p) * a), (p * a))) monoNode
-stereoize p (Right stereoNode) = fmap (\(MkLR (al, ar)) -> let a = al + ar in MkLR (((1 - p) * a), (p * a))) stereoNode
+{-# SPECIALIZE stereoize :: Pan -> Either (Node SynthVal) (Node (LR SynthVal)) -> Node (LR SynthVal) #-}
+stereoize p (Left monoNode) = fmap (\a -> MkLR ((1 - p) * a) (p * a)) monoNode
+stereoize p (Right stereoNode) = fmap (\(MkLR !al !ar) ->
+  let a = al + ar in MkLR ((1 - p) * a) (p * a)) stereoNode
 
 -- | The node-parameterized version of `stereoize`, where pan values may be from a node and
 -- not constant.
 stereoizeN :: (Num a) => Node a -> Either (Node a) (Node (LR a)) -> Node (LR a)
-stereoizeN panNode (Left monoNode) = liftA2 (\p a -> MkLR (((1 - p) * a), (p * a))) panNode monoNode
-stereoizeN panNode (Right stereoNode) = liftA2 (\p (MkLR (al, ar)) -> let a = al + ar in MkLR (((1 - p) * a), (p * a))) panNode stereoNode
+{-# SPECIALIZE stereoizeN :: Node Pan -> Either (Node SynthVal) (Node (LR SynthVal)) -> Node (LR SynthVal) #-}
+stereoizeN panNode (Left monoNode) = liftA2 (\p a -> MkLR ((1 - p) * a) (p * a)) panNode monoNode
+stereoizeN panNode (Right stereoNode) = liftA2 (\p (MkLR !al !ar) ->
+  let a = al + ar in MkLR ((1 - p) * a) (p * a)) panNode stereoNode
 
 -- | mono2stereo. Convenience to turn a mono real-valued signal into a stereo signal.
 m2s :: (Fractional a) => Node a -> Node (LR a)
+{-# SPECIALIZE m2s :: Node SynthVal -> Node (LR SynthVal) #-}
 m2s = stereoize 0.5 . Left
 
 --------------------------------------------------------------------------------
@@ -408,15 +411,15 @@ piecewiseMono t0 empt nodesDurs = out
   -- get initial state and form the output node
   out = case nodesDurs' of
     [] -> pure empt
-    ((firstNode, firstStart, firstDur):restNodes) -> MkNode0
+    ((!firstNode, !firstStart, !firstDur):restNodes) -> MkNode0
       (firstNode, firstStart, firstDur, restNodes) (\r _ s -> gogo r s)
   -- the state function for the node. check the start time of the next node and switch to it
   -- and consume one node from the list if its time is here, otherwise just keep playing the
   -- current node
-  gogo r@(t, _) (!currNode, !currStart, !currDur, nil@[]) = let
-    (x, new_currNode) = if t < currStart + currDur then runNode r currNode else (empt, currNode)
+  gogo r@(!t, _) (!currNode, !currStart, !currDur, nil@[]) = let
+    (!x, !new_currNode) = if t < currStart + currDur then runNode r currNode else (empt, currNode)
     in (x, (new_currNode, currStart, currDur, nil))
-  gogo r@(t, _) s@(currNode, !currStart, currDur, ls@((nextNode, !nextStart, nextDur):rest))
+  gogo r@(!t, _) s@(currNode, !currStart, currDur, ls@((nextNode, !nextStart, nextDur):rest))
     | t < currStart = (empt, s)
     | t < nextStart = let (x, new_currNode) = runNode r currNode in (x, (new_currNode, currStart, currDur, ls))
     | otherwise = nextNode `seq` nextStart `seq` nextDur `seq` rest `seq`
@@ -518,18 +521,19 @@ linearRamp = funcRamp id
 -- | Create a signal traversing an ADSR envelope according to some fixed envelope params.
 adsrEnvelope :: ADSRParams -> Node SynthVal
 adsrEnvelope (ADSR v0 tA tD v1 tS tR v2) = let
-  !dA = (1.0 - v0) / tA
-  !dD = (v1 - 1.0) / tD
-  !t0S = tA + tD
-  !t0R = t0S + tS
-  !dR = (v2 - v1) / tR
-  !tEnd = t0R + tR
-  in cache $ MkNode0 () $ \(t, _) _ s -> (\x -> (x, s)) $ if
-    | t < tA -> v0 + t * dA
-    | t < t0S -> 1.0 + (t - tA) * dD
-    | t < t0R -> v1
-    | t < tEnd -> v1 + (t - t0R) * dR
-    | otherwise -> v2
+  dA = (1.0 - v0) / tA
+  dD = (v1 - 1.0) / tD
+  t0S = tA + tD
+  t0R = t0S + tS
+  dR = (v2 - v1) / tR
+  tEnd = t0R + tR
+  in cache $ MkNode0 () $ \(!t, _) _ s ->
+    let x = if  | t < tA -> v0 + t * dA
+                | t < t0S -> 1.0 + (t - tA) * dD
+                | t < t0R -> v1
+                | t < tEnd -> v1 + (t - t0R) * dR
+                | otherwise -> v2
+    in (x, s)
 
 -- | Convenience shorthand for `adsrEnvelope` on an `ADSR` literal.
 nADSR :: SynthVal -> TimeVal -> TimeVal -> SynthVal -> TimeVal -> TimeVal -> SynthVal -> Node SynthVal
@@ -542,7 +546,7 @@ nADSR v0 tA tD v1 tS tR v2 = adsrEnvelope $ ADSR v0 tA tD v1 tS tR v2
 -- using the latest received ADSR parameters.
 adsrEnvelopeN :: Node ADSRParams -> Node SynthVal
 adsrEnvelopeN = mkNode1 (read "NaN" :: SynthVal, Nothing) $
-  \(t, d) (ADSR v0 tA tD v1 tS tR v2) (!x', !precalcs') -> let
+  \(!t, !d) (ADSR v0 tA tD v1 tS tR v2) (!x', !precalcs') -> let
     -- using NaN as a (Nothing :: Maybe Double) to not have to waste resources on Just unbox
     -- but this won't generalize to all choices of SynthVal...  but realistically it's fine?
     x = if isNaN x' then v0 else x'
@@ -554,7 +558,7 @@ adsrEnvelopeN = mkNode1 (read "NaN" :: SynthVal, Nothing) $
       , d * (v2 - v1) / tR
       , tA + tD + tS + tR
       ) id precalcs'
-    (mA, mD, t0S, t0R, mR, tEnd) = precalcs
+    (!mA, !mD, !t0S, !t0R, !mR, !tEnd) = precalcs
     -- (deltaTime * attackSlope, deltaTime * decaySlope, sustainStartT, releaseStartT, deltaTime * releaseSlope)
     newX = if | t < tA -> x + mA
               | t < t0S -> x + mD
@@ -588,8 +592,8 @@ twopi = 2 * pi
 -- | Shared signal function for sin oscillators, with a phase/angle accumulator as state and
 -- a phase input for phase modulation synthesis.
 -- Sine oscillator based on https://juce.com/tutorials/tutorial_sine_synth/
-_sinOsc_fn :: TimeVal -> Freq -> Gain -> SynthVal -> SynthVal -> (SynthVal, SynthVal)
-_sinOsc_fn !d !f !g !phase !myAngleState = let
+_sinOsc_fn :: TimeVal -> Gain -> Freq -> SynthVal -> SynthVal -> (SynthVal, SynthVal)
+_sinOsc_fn d g f phase myAngleState = let
   angleDelta = f * d
   newAngleState' = myAngleState + angleDelta
   newAngleState = if newAngleState' > 1 then newAngleState' - 1 else newAngleState'
@@ -603,18 +607,18 @@ _sinOsc_s0 :: SynthVal
 _sinOsc_s0 = 0.0
 {-# INLINE _sinOsc_s0 #-}
 
-_sinOsc_SF :: SF (Freq, Gain) SynthVal SynthVal
-_sinOsc_SF (_, d) (f, g) = _sinOsc_fn d f g 0
+_sinOsc_SF :: SF (Gain, Freq) SynthVal SynthVal
+_sinOsc_SF (_, !d) (!g, !f) = _sinOsc_fn d g f 0
 {-# INLINE _sinOsc_SF #-}
 
-_sinOscP_SF :: SF (SynthVal, Freq, Gain) SynthVal SynthVal
-_sinOscP_SF (_, d) (phase, f, g) = _sinOsc_fn d f g phase
+_sinOscP_SF :: SF (Gain, Freq, SynthVal) SynthVal SynthVal
+_sinOscP_SF (_, !d) (!g, !f, !phase) = _sinOsc_fn d g f phase
 {-# INLINE _sinOscP_SF #-}
 
 -- | Sine oscillator, holding state for the current angle.
-sinOsc :: Node Freq -> Node Gain -> Node SynthVal
+sinOsc :: Node Gain -> Node Freq -> Node SynthVal
 sinOsc = MkNode2 _sinOsc_s0 _sinOsc_SF
 
 -- | `sinOsc` but accepts phase as an input node (added to the angle of each sin compute).
-sinOscP :: Node SynthVal -> Node Freq -> Node Gain  -> Node SynthVal
+sinOscP :: Node Gain -> Node Freq -> Node SynthVal  -> Node SynthVal
 sinOscP = mkNode3 _sinOsc_s0 _sinOscP_SF

@@ -68,7 +68,7 @@ testSynth0 lc = finalNode
     g = lc <&> (.gain)
     e = lc <&> (.env) -- note envelope current value
     -- pan = lc <&> (.pan)
-    finalNode = m2s $ e * sinOsc (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02)) g
+    finalNode = m2s $ e * sinOsc g (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
 
 testSynth1 :: Node LiveCell -> Node (LR SynthVal)
 testSynth1 lc = finalNode
@@ -77,9 +77,9 @@ testSynth1 lc = finalNode
     g = lc <&> (.gain)
     e = cache $ lc <&> (.env) -- note envelope current value
     -- pan = lc <&> (.pan)
-    sinModulator3 = adsrEnvelope (ADSR 0.0 0.02 0.0 1.0 0.02 0.01 1.0) * sinOsc (5 *| f) e
-    fWithVibrato = (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
-    sinCarrier = sinOscP sinModulator3 fWithVibrato g
+    sinModulator3 = adsrEnvelope (ADSR 0.0 0.02 0.0 1.0 0.02 0.01 1.0) * sinOsc e (5 *| f)
+    fWithVibrato = (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
+    sinCarrier = sinOscP g fWithVibrato sinModulator3
     finalNode = m2s $ e * sinCarrier
 
 testSynth2 :: Node LiveCell -> Node (LR SynthVal)
@@ -88,19 +88,19 @@ testSynth2 lc = finalNode
     f = cache $ lc <&> (.freq)
     g = cache $ lc <&> (.gain)
     e = cache $ lc <&> (.env) -- note envelope current value
-    sinModulator1 = e * nADSR 0.1 0.04 0.0 1.0 0.05 0.01 1.0 * sinOsc (5 *| f) 0.7
+    sinModulator1 = e * nADSR 0.1 0.04 0.0 1.0 0.05 0.01 1.0 * sinOsc 0.7 (5 *| f)
     -- also apply a pitch envelope on top of vibrato
-    fWithVibrato = nADSR 0.0 0.01 0.0 1.0 0.05 0.01 1.0 * (f * (1 +| sinOsc 5 0.02))
-    sinCarrier1 = sinOscP sinModulator1 fWithVibrato g
-    sinModulator2 = nADSR 1.0 0.0 0.0 1.0 0.0 0.07 0.0 * sinOsc (6 *| f) 1.2
-    sinCarrier2 = sinOscP sinModulator2 (2 *| fWithVibrato) g
+    fWithVibrato = nADSR 0.0 0.01 0.0 1.0 0.05 0.01 1.0 * (f * (1 +| sinOsc 0.02 5))
+    sinCarrier1 = sinOscP g fWithVibrato sinModulator1
+    sinModulator2 = nADSR 1.0 0.0 0.0 1.0 0.0 0.07 0.0 * sinOsc 1.2 (6 *| f)
+    sinCarrier2 = sinOscP g (2 *| fWithVibrato) sinModulator2
     finalNode = m2s $ e * (sinCarrier1 + sinCarrier2)
 
 
 tonetestmainSDL :: IO ()
 tonetestmainSDL = do
   let sampleRate = 44100
-      bufferSize = 256
+      bufferSize = 128
       chanMode = Stereo
 
   putStrLn "Making song sample stream"
@@ -118,7 +118,7 @@ tonetestmainSDL = do
   -- putNode hah newDestNode
 
   putStrLn "Waiting before play start"
-  threadDelay (round $ 0.5 * sec)
+  threadDelay (round $ 0.1 * sec)
   putStrLn "Starting play"
   enableAudio hah
 

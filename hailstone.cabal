@@ -27,7 +27,7 @@ executable hailstone-sdltest
   main-is:             SDLTestMain.hs
   other-modules:       Sound.Hailstone.Backends.SDLAudio
   -- use the SDL audio backend
-  ghc-options:         -Wall -O3 -threaded -rtsopts -with-rtsopts "-N -maxN4 -H16m"
+  ghc-options:         -Wall -O3 -threaded -rtsopts -with-rtsopts "-N -maxN2 -H20m"
   -- note that -threaded is required for anything that FFIs to SDL2, otherwise
   -- it will segfault/crash horribly!
   default-language:    Haskell2010

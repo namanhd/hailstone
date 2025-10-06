@@ -133,31 +133,31 @@ unmaybePan :: Fractional a => Maybe a -> a
 unmaybePan = maybe 0.5 id
 
 -- | Convenience tuple of two audio values, one for each channel (left and right).
-newtype LR a = MkLR { lrTup :: (a, a) }
+data LR a = MkLR !a !a
   deriving (Eq, Show)
 
 instance Functor LR where
-  fmap f (MkLR (al, ar)) = MkLR (f al, f ar)
+  fmap f (MkLR al ar) = MkLR (f al) (f ar)
 
 instance Applicative LR where
   pure = dupLR
-  (MkLR (fl, fr)) <*> (MkLR (al, ar)) = MkLR (fl al, fr ar)
+  (MkLR fl fr) <*> (MkLR al ar) = MkLR (fl al) (fr ar)
 
 -- | Trivially make a mono value into a stereo value.
 dupLR :: a -> LR a
-dupLR a = MkLR (a, a)
+dupLR a = MkLR a a
 {-# INLINABLE dupLR #-}
 
 instance (Num a) => Num (LR a) where
-  (MkLR (al, ar)) + (MkLR (bl, br)) = MkLR ((al + bl), (ar + br))
-  (MkLR (al, ar)) * (MkLR (bl, br)) = MkLR ((al * bl), (ar * br))
-  (MkLR (al, ar)) - (MkLR (bl, br)) = MkLR ((al - bl), (ar - br))
-  abs (MkLR (al, ar)) = MkLR ((abs al), (abs ar))
-  negate (MkLR (al, ar)) = MkLR ((negate al), (negate ar))
-  signum (MkLR (al, ar)) = MkLR ((signum al), (signum ar))
+  (MkLR al ar) + (MkLR bl br) = MkLR (al + bl) (ar + br)
+  (MkLR al ar) * (MkLR bl br) = MkLR (al * bl) (ar * br)
+  (MkLR al ar) - (MkLR bl br) = MkLR (al - bl) (ar - br)
+  abs (MkLR al ar) = MkLR (abs al) (abs ar)
+  negate (MkLR al ar) = MkLR (negate al) (negate ar)
+  signum (MkLR al ar) = MkLR (signum al) (signum ar)
   fromInteger = dupLR . fromInteger
 
 instance (Fractional a) => Fractional (LR a) where
-  (MkLR (al, ar)) / (MkLR (bl, br)) = MkLR ((al / bl), (ar / br))
-  recip (MkLR (al, ar)) = MkLR ((recip al), (recip ar))
+  (MkLR al ar) / (MkLR bl br) = MkLR (al / bl) (ar / br)
+  recip (MkLR al ar) = MkLR (recip al) (recip ar)
   fromRational = dupLR . fromRational
