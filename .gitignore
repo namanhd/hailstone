@@ -1,2 +1,5 @@
 .stack-work
 *.txt
+*.hi
+*.o
+*.dump-simpl

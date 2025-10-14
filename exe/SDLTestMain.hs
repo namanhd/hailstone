@@ -10,9 +10,9 @@ import Control.Concurrent (threadDelay)
 
 testSong :: [Cell]
 testSong = let
-  nop = Nothing
+  nop = 0.5
   du = 0.5
-  myAdsr = ADSR 0.9 0.01 0.0 0.9 0.1 0.2 0.0
+  myAdsr = ADSR 0.01 0.0 0.1 0.2 0.9 0.9 0.0
   in (\cc -> cc du nop myAdsr) <$>
   [ MkC 440 0.25 0.0
   , MkC 550 0.25 0.5
@@ -25,10 +25,10 @@ testSong = let
 
 testSong2 :: [Cell]
 testSong2 = let
-  nop = Nothing
+  nop = 0.5
   sxthlen = 0.18
   b = (sxthlen *)
-  myAdsr = ADSR 0.9 0.01 0.0 0.9 0.08 0.1 0.0
+  myAdsr = ADSR 0.01 0.0 0.08 0.1 0.9 0.9 0.0
   p5 = ((3/2) *)
   downp5 = ((2/3) *)
   downp4 = ((3/4) *)
@@ -57,43 +57,40 @@ testSong2 = let
   , MkC (2 * r) 0.3 (b 17)
   ]
 
--- | shorthand constructor for `MkC`
-n :: Freq -> Gain -> TimeVal -> TimeVal -> Maybe Pan -> ADSRParams -> Cell
-n = MkC
 
 testSynth0 :: Node LiveCell -> Node (LR SynthVal)
 testSynth0 lc = finalNode
   where
     f = lc <&> (.freq)
-    g = lc <&> (.gain)
+    a = lc <&> (.ampl)
     e = lc <&> (.env) -- note envelope current value
     -- pan = lc <&> (.pan)
-    finalNode = m2s $ e * sinOsc g (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
+    finalNode = m2s $ e * sinOsc a (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
 
 testSynth1 :: Node LiveCell -> Node (LR SynthVal)
 testSynth1 lc = finalNode
   where
     f = cache $ lc <&> (.freq)
-    g = lc <&> (.gain)
+    a = lc <&> (.ampl)
     e = cache $ lc <&> (.env) -- note envelope current value
     -- pan = lc <&> (.pan)
-    sinModulator3 = adsrEnvelope (ADSR 0.0 0.02 0.0 1.0 0.02 0.01 1.0) * sinOsc e (5 *| f)
+    sinModulator3 = adsrEnvelope (ADSR 0.02 0.0 0.02 0.01 0.0 1.0 1.0) * sinOsc e (5 *| f)
     fWithVibrato = (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
-    sinCarrier = sinOscP g fWithVibrato sinModulator3
+    sinCarrier = sinOscP a fWithVibrato sinModulator3
     finalNode = m2s $ e * sinCarrier
 
 testSynth2 :: Node LiveCell -> Node (LR SynthVal)
 testSynth2 lc = finalNode
   where
     f = cache $ lc <&> (.freq)
-    g = cache $ lc <&> (.gain)
+    a = cache $ lc <&> (.ampl)
     e = cache $ lc <&> (.env) -- note envelope current value
-    sinModulator1 = e * nADSR 0.1 0.04 0.0 1.0 0.05 0.01 1.0 * sinOsc 0.7 (5 *| f)
     -- also apply a pitch envelope on top of vibrato
-    fWithVibrato = nADSR 0.0 0.01 0.0 1.0 0.05 0.01 1.0 * (f * (1 +| sinOsc 0.02 5))
-    sinCarrier1 = sinOscP g fWithVibrato sinModulator1
-    sinModulator2 = nADSR 1.0 0.0 0.0 1.0 0.0 0.07 0.0 * sinOsc 1.2 (6 *| f)
-    sinCarrier2 = sinOscP g (2 *| fWithVibrato) sinModulator2
+    fWithVibrato = cache $ nADSR 0.01 0.0 0.05 0.01 0.0 1.0 1.0 * (f * (1 +| sinOsc 0.02 5))
+    sinModulator1 = e * nADSR  0.04 0.0 0.05 0.01 0.1 1.0 1.0 * sinOsc 0.7 (5 *| f)
+    sinCarrier1 = sinOscP a fWithVibrato sinModulator1
+    sinModulator2 = nADSR 0.0 0.0 0.0 0.07 1.0 1.0 0.0 * sinOsc 1.2 (6 *| f)
+    sinCarrier2 = sinOscP a (2 *| fWithVibrato) sinModulator2
     finalNode = m2s $ e * (sinCarrier1 + sinCarrier2)
 
 

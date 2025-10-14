@@ -73,9 +73,9 @@ runNode r = go
       in (x, MkNode2 new_s sig new_aNode new_bNode)
 ```
 
-The comments in `Sound/Hailstone/Synth.hs` say more on the reasoning behind our choice of primitives/constructors and their evaluation semantics. However, this essentially lets us fairly directly translate object-oriented DSP code into our `Node` representation while preserving composability on the surface with the provided nodes and combinators.
+The implementation in `Sound/Hailstone/Synth.hs` has more specialized constructors and `SF` types for efficiency (to not require dummy state, etc), but these ideas still hold. This essentially lets us fairly directly translate object-oriented DSP code into our `Node` representation while preserving composability on the surface with the provided nodes and combinators.
 
-> There's also a nice Applicative instance we get almost for free with `MkNode2`, useful for lifting pure code into nodes.
+> There's also a nice Applicative instance we get almost for free, useful for lifting pure code into nodes.
 > 
 > We could probably swizzle this type into an Arrow; packaging static state together with a state-transforming function was one of the [motivating examples for Hughes's Arrows](https://www.cse.chalmers.se/~rjmh/afp-arrows.pdf). Arrows are also the primary abstraction used by e.g. [Euterpea](https://hackage.haskell.org/package/Euterpea), supporting a "native" syntax for defining signal graphs. However, arrows are somewhat clunky, have some overhead in the combinators, and so far I am doing fine with just the applicative instance. I will explore this later if it turns out to become necessary.
 
@@ -84,29 +84,29 @@ The comments in `Sound/Hailstone/Synth.hs` say more on the reasoning behind our 
 As an example of how close this is to the usual OOP representation of audio units, here's a sine oscillator that holds its current angle as state (a *phase accumulator*, important for correct pitch sliding and other synthesis), translated nearly directly from https://juce.com/tutorials/tutorial_sine_synth/.
 
 ```haskell
-sinOsc :: Node Gain -> Node Freq -> Node SynthVal
-sinOsc = MkNode2 0.0 $ \(_, d) (gain, f) angleAccum -> let
+sinOsc :: Node Ampl -> Node Freq -> Node SynthVal
+sinOsc = MkNode2 0.0 $ \(_, d) (a, f) angleAccum -> let
   angleDelta = f * (d * twopi)
   newAccum' = angleAccum + angleDelta
   newAccum = if newAccum' > twopi then newAccum' - twopi else newAccum'
-  in (gain * sin angleAccum, newAccum)
+  in (a * sin angleAccum, newAccum)
 ```
 
 This is a function that takes two nodes (an amplitude-emitting node and a frequency-emitting node) and returns a stateful node that computes a sine wave, with state behind the scenes (the phase accumulator, initialized with 0.0) that the caller of this function does not have to explicitly handle.
 
 As the parameters to this node are themselves nodes, only function application is needed to route them to this node, with correctly-handled states when the tree is finally evaluated.
 
-For instance, we can specify a `sinOsc` to be used to modulate the frequency of another `sinOsc`, for vibrato or perhaps FM synthesis. This defines a sin oscillator/instrument that has a 10Hz sinusoidal vibrato with amplitude 0.02 applied to the frequency by adding 1 and multiplying.
+For instance, we can specify a `sinOsc` to be used to modulate the frequency of another `sinOsc`, for vibrato or perhaps FM synthesis. This defines a sin oscillator that has a 10Hz sinusoidal vibrato with amplitude 0.02 applied to the frequency by adding 1 and multiplying.
 ```haskell
-sinWithVibrato :: Node Gain -> Node Freq -> Node SynthVal
-sinWithVibrato g f = sinOsc g (f * (1 +| sinOsc 0.02 10))
+sinWithVibrato :: Node Ampl -> Node Freq -> Node SynthVal
+sinWithVibrato a f = sinOsc a (f * (1 +| sinOsc 0.02 10))
 ```
 
 We can also make the vibrato frequency ramp up linearly over time by making the frequency argument of the modulating `sinOsc` be a `linearRamp`, going from 5Hz to 12Hz in 1.2 seconds:
 
 ```haskell
-sinWithRampingVibrato :: Node Gain -> Node Freq -> Node SynthVal
-sinWithRampingVibrato g f = sinOsc g (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
+sinWithRampingVibrato :: Node Ampl -> Node Freq -> Node SynthVal
+sinWithRampingVibrato a f = sinOsc a (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
 ```
 
 > Nodes have a `Num` and `Fractional` instance, so we can just specify bare number literals and they will get automatically lifted to constant `Node`s emitting those values. Likewise for default math binary operations which are supported, though specialized for scalar-node adds/multiplies there are also the `(+|)` and `(*|)` operators.
@@ -138,23 +138,26 @@ will create a node that
 Built on top of `piecewisePoly`, the function `retriggerWith` plays a melody
 using a "synth/instrument". This is done by "restarting" an instrument node on every new note, rather than letting the instrument sound evolve independently of the notes.
 
-An *instrument* is any function parameterized by a Node emitting `LiveCell` values. A `LiveCell` describes the instantaneous playing parameters of a note, such as pitch, volume/gain, envelope progress, and potentially other values; a stream of `LiveCell` is rendered from the higher-level static `Cell` specification of a note.
+An *instrument* is any function parameterized by a Node emitting `LiveCell` values. A `LiveCell` describes the instantaneous playing parameters of a note, such as pitch, volume/amplitude, envelope progress, and potentially other values; a stream of `LiveCell` is rendered from the higher-level static `Cell` specification of a note.
 
-This way, instruments/synths can react in their own way to a note's gain, envelope, or any other high-level modulating parameter. We'll also have room to implement e.g. note-level effects with per-note parameters such as per-note
+This way, instruments/synths can react in their own way to a note's volume, envelope, or any other high-level modulating parameter. We'll also have room to implement e.g. note-level effects with per-note parameters such as per-note
 vibrato or portamento.
 
 ### Node graphs
 
 The Node datatype is really just a binary tree. However, audio nodes/units like the ones in the Web Audio API, or any other modular audio environment such as Pd or Max, are nodes in an *audio graph*, not just a tree. A Node should be able to direct its output to multiple nodes (i.e. have multiple parents), which is impossible to represent with a tree.
 
-It turns out that we can add this feature to our tree datatype using an old eDSL-building trick, *observable sharing*, which makes visible to the embedded language the host (embedding) language's name bindings and value reuse. There's a good [writeup on this](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md) and [its implementation in reactive-banana](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/src/Reactive/Banana/Prim/High/Cached.hs), with relevant citations. All proposed realizations in Haskell involve using `unsafePerformIO` to keep a sort of private IO mutable variable in each initialization of an object to be shared. It's a slimy hack that breaks referential transparency (on purpose), but it is very useful and grants greatly enhanced compute efficiency.
+#### Observable sharing at the EDSL level
+It turns out that we can add this feature to our tree datatype using an old EDSL-building trick, *observable sharing*, which makes visible to the embedded language the host (embedding) language's name bindings and value reuse. There's a good [writeup on this](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md) and [its implementation in reactive-banana](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/src/Reactive/Banana/Prim/High/Cached.hs), with relevant citations. All proposed realizations in Haskell involve using `unsafePerformIO` to keep a sort of private IO mutable variable in each initialization of an object to be shared. 
+
+*This is a slimy hack that breaks referential transparency* (on purpose), but it is useful, self-contained, and grants compute efficiency. In our case, as long as nodes are run via `runNode` with a properly-incremented `SigEnv`, this won't change the denotation of the program; i.e. using `cache` should not change the resulting audio; it merely improves performance.
 
 I've implemented this as the function `cache :: Node x -> Node x`. In a portion of code such as
 ```haskell
 let ff        = cache f  -- f :: Node Freq
-    modulator = cache (sinOsc (3 *| ff) 0.5)
-    carrier1  = sinOscP modulator ff 1.0
-    carrier2  = sinOscP modulator (2 *| ff) 0.25
+    modulator = cache (sinOsc 0.5 (3 *| ff))
+    carrier1  = sinOscP 1.0 ff modulator
+    carrier2  = sinOscP 0.25 (2 *| ff) modulator
     finalNode = carrier1 + carrier2
 in finalNode
 ```
@@ -163,6 +166,10 @@ The frequency-emitting node `f` is converted into a caching/memoized node with `
 (Without `cache`, the node `f` would be duplicated across all its use sites, as that's the only representation of this relationship in a binary tree rather than a DAG. This would result in repeated computation of `f`, and if that computation is taxing (i.e. if `f` is itself is the head of a huge node tree) then this will quickly grow to become infeasible to compute at speed.)
 
 Likewise, `modulator` is made a caching node, and its output is the shared phase modulation input for two other sine oscillators. Caching allows genuine reuse of the modulator value, which is now computed only once each sampling step.
+
+#### Morally right way to do signal forks
+Of course, `cache` is meant for the higher-level EDSL user-facing interface of composing nodes together.
+If one is up for the task of writing new nodes/node functions (such as the library implementer, or an enterprising EDSL user), the better way is to directly write a new node function with this logic in the signal function itself. For instance, one could define a bespoke node like the sine oscillator node example given above. Its signal function might use the same value from an argument node for multiple math operations; inside the signal function is normal pure Haskell code operating on real values, so normal, expected sharing semantics apply.
 
 
 ## Composition
