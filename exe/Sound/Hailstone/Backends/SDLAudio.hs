@@ -26,7 +26,7 @@ import Sound.Hailstone.Synth
 type SampleChIn = UU.InChan SampleVal
 type SampleChOut = UU.OutChan SampleVal
 
-data HailstoneAudioHandle = MkHAH
+data HailstoneAudioHandle e = MkHAH
   { _HAHsdlAudioDevice :: SDL.AudioDevice
   -- ^ SDL audio device
   , _HAHchanMode :: ChanMode
@@ -35,7 +35,7 @@ data HailstoneAudioHandle = MkHAH
   -- ^ sample rate
   , _HAHproducerThreadId :: ThreadId
   -- ^ thread ID of the producer thread
-  , _HAHreplacementSinkMV :: MVar Sink
+  , _HAHreplacementSinkMV :: MVar (Sink e)
   -- ^ comms channel to give the producer thread a new sink to play
   }
 
@@ -53,7 +53,7 @@ tryTakeMVarWithDefault (GHCMV.MVar m) dflt = GHCB.IO $ \s -> case tryTakeMVar# m
   (# s', _, !a #) -> (# s', a #)
 
 -- | loop body for producer thread
-producerLoop :: Int -> ChanMode -> SampleChIn -> MVar Int -> MVar Sink -> Sink -> IO ()
+producerLoop :: Int -> ChanMode -> SampleChIn -> MVar Int -> MVar (Sink e) -> Sink e -> IO ()
 producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV sink = do
   !sinkToPlayNow <- tryTakeMVarWithDefault replacementSinkMV sink
   !qc' <- tryReadMVarWithDefault queuedCountMV maxQueueLen
@@ -62,9 +62,10 @@ producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV sink = do
   then producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV sinkToPlayNow
   else do
     let !node = _destNode sinkToPlayNow
-        !r@(!t, !d) = _sigEnv sinkToPlayNow
-        !(MkSP (MkLR xl xr) nextNode) = runNode r node
-        !nextSink = MkSink { _destNode = nextNode, _sigEnv = (t + d, d) }
+        !r@(t, d, e) = _sigEnv sinkToPlayNow
+        !(MkS2 (MkLR xl xr) nextNode) = runNode r node
+        -- TODO we can do something with this e. like get outside info, MIDI messages, etc
+        !nextSink = MkSink { _destNode = nextNode, _sigEnv = (t + d, d, e) }
     -- write samples to the channel
     case cm of
       Stereo -> modifyMVar_ queuedCountMV $ \(!qc) -> do
@@ -78,7 +79,7 @@ producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV sink = do
     producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV nextSink
 
 -- | Start the producer thread which will loop forever and write to the sample chan.
-startProducer :: Word16 -> ChanMode -> Sink -> IO (SampleChOut, MVar Int, MVar Sink, ThreadId)
+startProducer :: Word16 -> ChanMode -> Sink e -> IO (SampleChOut, MVar Int, MVar (Sink e), ThreadId)
 startProducer specifiedBufferSize cm sink = do
   -- comms channel for the producer to give us samples to copy to the SDL buffer
   (sampChI, sampChO) <- UU.newChan
@@ -118,14 +119,14 @@ sdlAudioCallback cm sampChO queuedCountMV sdlAudioFormat sdlAudioBuffer = case s
 
 -- | Initialize SDL (the Audio subsystem only) given a sample rate, buffer size, and initial
 -- node graph.
-openAudio :: SampleRate -> Word16 -> ChanMode -> Node (LR SampleVal) -> IO HailstoneAudioHandle
-openAudio sampleRate specifiedBufferSize chanMode initNode = do
+openAudio :: SampleRate -> Word16 -> ChanMode -> e -> Node e (LR SampleVal) -> IO (HailstoneAudioHandle e)
+openAudio sampleRate specifiedBufferSize chanMode initEnv initNode = do
   SDL.initialize [SDL.InitAudio]
   let sampleType = SDL.Signed16BitNativeAudio
       stereoMode = case chanMode of
         Mono -> SDL.Mono
         Stereo -> SDL.Stereo
-      fresh = initSink sampleRate
+      fresh = initSink sampleRate initEnv
       sink = fresh { _destNode = initNode }
 
   -- start the producer thread
@@ -160,28 +161,28 @@ openAudio sampleRate specifiedBufferSize chanMode initNode = do
     }
 
 -- | Close SDL audio. Should be called at the end of main. Also kills the producer thread.
-closeAudio :: HailstoneAudioHandle -> IO ()
+closeAudio :: HailstoneAudioHandle e -> IO ()
 closeAudio hah = SDL.closeAudioDevice (_HAHsdlAudioDevice hah)
   *> killThread (_HAHproducerThreadId hah)
 
 -- | Play a new node graph.
-putNode :: HailstoneAudioHandle -> Node (LR SampleVal) -> IO ()
-putNode hah newNode = do
+putNode :: HailstoneAudioHandle e -> e -> Node e (LR SampleVal) -> IO ()
+putNode hah newEnv newNode = do
   -- update the sample source (and reset the time counter), but don't change
   -- anything about the delta value
-  let fresh = initSink $ _HAHsampleRate hah
+  let fresh = initSink (_HAHsampleRate hah) newEnv
       newSink = fresh { _destNode = newNode }
       replacementSinkMV = _HAHreplacementSinkMV hah
   putMVar replacementSinkMV newSink
 
 -- | Enable SDL audio, beginning playback. (gc first then do it)
-enableAudio :: HailstoneAudioHandle -> IO ()
+enableAudio :: HailstoneAudioHandle e -> IO ()
 enableAudio hah = performGC *> SDL.setAudioDevicePlaybackState (_HAHsdlAudioDevice hah) SDL.Play
 
 -- | Pauses SDL audio. (This prevents the SDL audio callback from firing.)
-lockAudio :: HailstoneAudioHandle -> IO ()
+lockAudio :: HailstoneAudioHandle e -> IO ()
 lockAudio hah = SDL.setAudioDeviceLocked (_HAHsdlAudioDevice hah) SDL.Locked
 
 -- | Resumes SDL audio.
-resumeAudio :: HailstoneAudioHandle -> IO ()
+resumeAudio :: HailstoneAudioHandle e -> IO ()
 resumeAudio hah = SDL.setAudioDeviceLocked (_HAHsdlAudioDevice hah) SDL.Unlocked

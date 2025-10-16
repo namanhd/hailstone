@@ -58,7 +58,7 @@ testSong2 = let
   ]
 
 
-testSynth0 :: Node LiveCell -> Node (LR SynthVal)
+testSynth0 :: Node e LiveCell -> Node e (LR SynthVal)
 testSynth0 lc = finalNode
   where
     f = lc <&> (.freq)
@@ -67,7 +67,7 @@ testSynth0 lc = finalNode
     -- pan = lc <&> (.pan)
     finalNode = m2s $ e * sinOsc a (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
 
-testSynth1 :: Node LiveCell -> Node (LR SynthVal)
+testSynth1 :: Node e LiveCell -> Node e (LR SynthVal)
 testSynth1 lc = finalNode
   where
     f = cache $ lc <&> (.freq)
@@ -79,7 +79,7 @@ testSynth1 lc = finalNode
     sinCarrier = sinOscP a fWithVibrato sinModulator3
     finalNode = m2s $ e * sinCarrier
 
-testSynth2 :: Node LiveCell -> Node (LR SynthVal)
+testSynth2 :: Node e LiveCell -> Node e (LR SynthVal)
 testSynth2 lc = finalNode
   where
     f = cache $ lc <&> (.freq)
@@ -109,13 +109,13 @@ tonetestmainSDL = do
     destNode = asPCM summedNode
 
   putStrLn "Opening audio"
-  hah <- openAudio sampleRate bufferSize chanMode destNode
+  hah <- openAudio sampleRate bufferSize chanMode () destNode
 
   -- -- can replace node with
-  -- putNode hah newDestNode
+  -- putNode hah () newDestNode
 
   putStrLn "Waiting before play start"
-  threadDelay (round $ 0.1 * sec)
+  threadDelay (round $ 0.12 * sec)
   putStrLn "Starting play"
   enableAudio hah
 

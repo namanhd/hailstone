@@ -1,4 +1,5 @@
 {-# LANGUAGE Strict #-}
+{-# OPTIONS_GHC -funbox-strict-fields #-}
 {-# LANGUAGE OverloadedRecordDot, DuplicateRecordFields, BangPatterns #-}
 
 module Sound.Hailstone.Types
@@ -7,11 +8,12 @@ module Sound.Hailstone.Types
   SynthVal
   -- ** Synonyms for `SynthVal` for its different uses
 , Freq, Ampl, Gain, Pan, TimeVal
-  -- ** Strict pair
-, SP(..)
-  -- ** Convenience LR type for tupling up two values, one for each stereo channel
+  -- ** Strict tuples
+, SPair(..)
+, STriple(..)
+  -- *** Strict stereo pair
 , LR(..)
-, dupLR
+, dupLR, (.+:), (.*:)
   -- ** Integer types
 , SampleRate, SampleVal
   -- ** Note data & config
@@ -20,6 +22,9 @@ module Sound.Hailstone.Types
 , LiveCell(..)
 , ADSRParams(..)
 , adsrTotalTime
+  -- ** For RBJ audio EQ cookbook 2nd-order filters
+, CookbookFilterCoeffs(..)
+, CookbookFilterState(..)
 ) where
 
 import Data.Int (Int16)
@@ -117,7 +122,11 @@ adsrTotalTime (ADSR !tA !tD !tS !tR _ _ _)  = tA + tD + tS + tR
 {-# INLINABLE adsrTotalTime #-}
 
 -- | Strict pair.
-data SP a b = MkSP !a !b
+data SPair a b = MkS2 !a !b
+  deriving (Eq, Show)
+
+-- | Strict triple.
+data STriple a b c = MkS3 !a !b !c
   deriving (Eq, Show)
 
 -- | Convenience tuple of two audio values, one for each channel (left and right).
@@ -129,23 +138,73 @@ instance Functor LR where
 
 instance Applicative LR where
   pure = dupLR
+  {-# INLINE pure #-}
   (MkLR fl fr) <*> (MkLR al ar) = MkLR (fl al) (fr ar)
+  {-# INLINABLE (<*>) #-}
+  liftA2 f (MkLR al ar) (MkLR bl br) = MkLR (f al bl) (f ar br)
+  {-# INLINABLE liftA2 #-}
 
 -- | Trivially make a mono value into a stereo value.
 dupLR :: a -> LR a
 dupLR a = MkLR a a
 {-# INLINABLE dupLR #-}
 
+-- | Add a scalar to an `LR`.
+(.+:) :: Num a => a -> LR a -> LR a
+a .+: (MkLR l r) = (MkLR (a + l) (a + r))
+
+-- | Scale an `LR` by a scalar.
+(.*:) :: Num a => a -> LR a -> LR a
+a .*: (MkLR l r) = (MkLR (a * l) (a * r))
+
 instance (Num a) => Num (LR a) where
-  (MkLR al ar) + (MkLR bl br) = MkLR (al + bl) (ar + br)
-  (MkLR al ar) * (MkLR bl br) = MkLR (al * bl) (ar * br)
-  (MkLR al ar) - (MkLR bl br) = MkLR (al - bl) (ar - br)
-  abs (MkLR al ar) = MkLR (abs al) (abs ar)
-  negate (MkLR al ar) = MkLR (negate al) (negate ar)
-  signum (MkLR al ar) = MkLR (signum al) (signum ar)
-  fromInteger = dupLR . fromInteger
+  (+) = liftA2 (+)
+  (*) = liftA2 (*)
+  (-) = liftA2 (-)
+  abs = fmap abs
+  negate = fmap negate
+  signum = fmap signum
+  fromInteger = pure . fromInteger
 
 instance (Fractional a) => Fractional (LR a) where
-  (MkLR al ar) / (MkLR bl br) = MkLR (al / bl) (ar / br)
-  recip (MkLR al ar) = MkLR (recip al) (recip ar)
-  fromRational = dupLR . fromRational
+  (/) = liftA2 (/)
+  recip = fmap recip
+  fromRational = pure . fromRational
+
+instance (Floating a) => Floating (LR a) where
+  pi = pure pi
+  exp = fmap exp
+  log = fmap log
+  sin = fmap sin
+  cos = fmap cos
+  sqrt = fmap sqrt
+  asin = fmap asin
+  acos = fmap acos
+  atan = fmap atan
+  sinh = fmap sinh
+  cosh = fmap cosh
+  asinh = fmap asinh
+  acosh = fmap acosh
+  atanh = fmap atanh
+  (**) = liftA2 (**)
+  logBase = liftA2 logBase
+
+-- | see https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
+data CookbookFilterCoeffs = MkCFCoeffs
+  { _a0inv :: !SynthVal
+  , _a1 :: !SynthVal
+  , _a2 :: !SynthVal
+  , _b0 :: !SynthVal
+  , _b1 :: !SynthVal
+  , _b2 :: !SynthVal
+  } deriving (Show, Eq)
+
+-- | see https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
+data CookbookFilterState = MkCFState
+  { _xm0 :: {-# NOUNPACK #-} !(LR SynthVal)
+  , _xm1 :: {-# NOUNPACK #-} !(LR SynthVal)
+  , _xm2 :: {-# NOUNPACK #-} !(LR SynthVal)
+  , _ym0 :: {-# NOUNPACK #-} !(LR SynthVal)
+  , _ym1 :: {-# NOUNPACK #-} !(LR SynthVal)
+  , _ym2 :: {-# NOUNPACK #-} !(LR SynthVal)
+  } deriving (Show, Eq)
