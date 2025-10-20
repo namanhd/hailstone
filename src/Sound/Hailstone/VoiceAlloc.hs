@@ -1,5 +1,4 @@
 {-# LANGUAGE BangPatterns #-}
--- | An excuse to implement a priority queue / min heap
 module Sound.Hailstone.VoiceAlloc
 (voiceAlloc)
 where
@@ -7,61 +6,30 @@ where
 import Data.List (sortOn, groupBy)
 
 -- | Binary min-heap with height information, using @v@ as the key for items of type @a@.
+-- This is Okasaki's leftist min heap implementation.
 data MinBinHeap v a = Bin !Int !v !a !(MinBinHeap v a) !(MinBinHeap v a) | Empt
   deriving (Show)
 
--- | Gets the height, where `Empt` has height 0 and a singleton tree has height 1. /O(1)/
 height :: MinBinHeap v a -> Int
 height Empt = 0
 height (Bin h _ _ _ _) = h
 
--- | Inserts an entry with a priority value into the heap. /O(log n)/ worst case, but /O(1)/
--- on average. (This does insertion into the last level and the percolate-up all in one go.)
+makeT :: v -> a -> MinBinHeap v a -> MinBinHeap v a -> MinBinHeap v a
+makeT v a l r = let hl = height l; hr = height r in
+  if hl >= hr then Bin (hr + 1) v a l r else Bin (hl + 1) v a r l
+
+merge :: Ord v => MinBinHeap v a -> MinBinHeap v a -> MinBinHeap v a
+merge h Empt = h
+merge Empt h = h
+merge heap1@(Bin _ v1 a1 l1 r1) heap2@(Bin _ v2 a2 l2 r2) =
+  if v1 <= v2 then makeT v1 a1 l1 (merge r1 heap2) else makeT v2 a2 l2 (merge heap1 r2)
+
 insert :: Ord v => v -> a -> MinBinHeap v a -> MinBinHeap v a
-insert value entry heap = case heap of
-  Empt -> Bin 1 value entry Empt Empt
-  Bin h v a l r -> case compare (height l) (height r) of
-    GT -> let inductive@(Bin h' v' a' l' r') = insert value entry r
-      in if v' >= v then Bin h v a l inductive else Bin h v' a' l (Bin h' v a l' r')
-    leq -> let inductive@(Bin h' v' a' l' r') = insert value entry l; bump = case leq of EQ -> succ h; _ -> h
-      in if v' >= v then Bin bump v a inductive r else Bin bump v' a' (Bin h' v a l' r') r
+insert v a = merge (Bin 1 v a Empt Empt)
 
-grabLast :: MinBinHeap v a -> (MinBinHeap v a, MinBinHeap v a)
-grabLast heap = case heap of
-  Empt -> (Empt, Empt)
-  Bin _ _ _ Empt Empt -> (heap, Empt)
-  Bin h v a l Empt -> (l, Bin (pred h) v a Empt Empt)
-  Bin h v a Empt r -> (r, Bin (pred h) v a Empt Empt)
-  Bin _ v a l r -> let hl = height l; hr = height r in if hl > hr
-    then let (grabbed, new_l) = grabLast l in (grabbed, Bin (succ $ max (height new_l) hr) v a new_l r)
-    else let (grabbed, new_r) = grabLast r in (grabbed, Bin (succ $ max hl (height new_r)) v a l new_r)
-
-percolateDown :: Ord v => MinBinHeap v a -> MinBinHeap v a
-percolateDown heap = case heap of
-  Empt -> Empt
-  Bin _ _ _ Empt Empt -> heap
-  Bin h v a (Bin h' v' a' l' r') Empt -> if v <= v' then heap else Bin h v' a' (percolateDown (Bin h' v a l' r')) Empt
-  Bin h v a Empt (Bin h' v' a' l' r') -> if v <= v' then heap else Bin h v' a' Empt (percolateDown (Bin h' v a l' r'))
-  Bin h v a l@(Bin h1 v1 a1 l1 r1) r@(Bin h2 v2 a2 l2 r2) -> let
-    pickLeft = v1 < v2
-    v' = if pickLeft then v1 else v2
-    in  if v <= v'
-        then heap
-        else  if pickLeft
-              then Bin h v1 a1 (percolateDown $ Bin h1 v a l1 r1) r
-              else Bin h v2 a2 l (percolateDown $ Bin h2 v a l2 r2)
-
--- | This does not return the head/min, it just deletes it, restores the heap property by
--- percolating down, and returns the resulting heap. /O(log n)/.
 deleteMin :: Ord v => MinBinHeap v a -> MinBinHeap v a
-deleteMin heap = let
-  -- pull the "last" item up to replace the head, and then percolate down
-  (grabbed, after) = grabLast heap
-  in case grabbed of
-    Empt -> Empt
-    Bin _ v' a' _ _ -> case after of
-      Empt -> Empt
-      Bin h _ _ l r -> percolateDown $ Bin h v' a' l r
+deleteMin Empt = Empt
+deleteMin (Bin _ _ _ l r) = merge l r
 
 -- | If the heap is not empty, get the minimum value and its associated entry.
 peekMin :: MinBinHeap v a -> Maybe (v, a)

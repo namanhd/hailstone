@@ -1,30 +1,25 @@
-{-# LANGUAGE GADTs, BangPatterns, MagicHash, UnboxedTuples #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Sound.Hailstone.Backends.SDLAudio
 ( HailstoneAudioHandle
-, openAudio
+, withAudio
 , enableAudio
 , putNode
 , lockAudio
 , resumeAudio
-, closeAudio
 )
 where
 
-import Control.Concurrent
-import qualified Control.Concurrent.Chan.Unagi.Unboxed as UU  -- concurrent FIFO channel
+-- SDL backend specific
 import qualified SDL as SDL
-import Data.Word (Word16) -- for buffer size
 import qualified Data.Vector.Storable.Mutable as SMV
-import System.Mem
-import qualified GHC.Base as GHCB
-import GHC.Exts (tryReadMVar#, tryTakeMVar#)
-import qualified GHC.MVar as GHCMV
 
+import System.Mem (performGC)
+import Data.Word (Word16)
+import Control.Concurrent
+import qualified Sound.Hailstone.Backends.Common as Common
 import Sound.Hailstone.Synth
-
-type SampleChIn = UU.InChan SampleVal
-type SampleChOut = UU.OutChan SampleVal
 
 data HailstoneAudioHandle e = MkHAH
   { _HAHsdlAudioDevice :: SDL.AudioDevice
@@ -39,88 +34,25 @@ data HailstoneAudioHandle e = MkHAH
   -- ^ comms channel to give the producer thread a new sink to play
   }
 
--- | these should strictly allocate less than `tryReadMVar` which returns IO (Maybe a) but
--- somehow they have weirdly different deadlock behavior in the sdl callback when subbed in
--- the same place with the same usage...???
-tryReadMVarWithDefault :: GHCMV.MVar a -> a -> IO a
-tryReadMVarWithDefault (GHCMV.MVar m) dflt = GHCB.IO $ \s -> case tryReadMVar# m s of
-  (# s', 0#, _ #) -> (# s', dflt #)
-  (# s', _, !a #) -> (# s', a #)
-
-tryTakeMVarWithDefault :: GHCMV.MVar a -> a -> IO a
-tryTakeMVarWithDefault (GHCMV.MVar m) dflt = GHCB.IO $ \s -> case tryTakeMVar# m s of
-  (# s', 0#, _ #) -> (# s', dflt #)
-  (# s', _, !a #) -> (# s', a #)
-
--- | loop body for producer thread
-producerLoop :: Int -> ChanMode -> SampleChIn -> MVar Int -> MVar (Sink e) -> Sink e -> IO ()
-producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV sink = do
-  !sinkToPlayNow <- tryTakeMVarWithDefault replacementSinkMV sink
-  !qc' <- tryReadMVarWithDefault queuedCountMV maxQueueLen
-  if qc' >= maxQueueLen
-  -- stall until qc' goes under this cap again
-  then producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV sinkToPlayNow
-  else do
-    let !node = _destNode sinkToPlayNow
-        !r@(t, d, e) = _sigEnv sinkToPlayNow
-        !(MkS2 (MkLR xl xr) nextNode) = runNode r node
-        -- TODO we can do something with this e. like get outside info, MIDI messages, etc
-        !nextSink = MkSink { _destNode = nextNode, _sigEnv = (t + d, d, e) }
-    -- write samples to the channel
-    case cm of
-      Stereo -> modifyMVar_ queuedCountMV $ \(!qc) -> do
-        UU.writeChan sampChI xl
-        UU.writeChan sampChI xr
-        pure (qc + 2)
-      Mono -> modifyMVar_ queuedCountMV $ \(!qc) -> do
-        UU.writeChan sampChI (xl + xr)
-        pure (qc + 1)
-    -- loop
-    producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV nextSink
-
--- | Start the producer thread which will loop forever and write to the sample chan.
-startProducer :: Word16 -> ChanMode -> Sink e -> IO (SampleChOut, MVar Int, MVar (Sink e), ThreadId)
-startProducer specifiedBufferSize cm sink = do
-  -- comms channel for the producer to give us samples to copy to the SDL buffer
-  (sampChI, sampChO) <- UU.newChan
-  -- comms channel for us to give the producer new replacement sinks to play
-  replacementSinkMV <- newEmptyMVar
-  -- comms channel to limit the number of samples in the queue
-  queuedCountMV <- newMVar 0
-  -- make the producer thread. make this configurable? the queue should be as
-  -- big as the specified buffer size... we could add some leeway. this can be as big as we
-  -- want for just song playback, but it should be small (still >=bufferSize) to respond to
-  -- real time inputs if we ever do that
-  let !maxQueueLen = fromIntegral $ specifiedBufferSize * (case cm of Stereo -> 2; _ -> 1)
-  threadId <- forkIO $ producerLoop maxQueueLen cm sampChI queuedCountMV replacementSinkMV sink
-  pure (sampChO, queuedCountMV, replacementSinkMV, threadId)
-
 -- | callback that SDL will fire to fill a buffer of samples to play
 sdlAudioCallback  :: ChanMode -- ^ stereo or mono
-                  -> SampleChOut -- ^the output end of the sample chan/queue, to consume
-                  -> MVar Int -- ^queued count
+                  -> Common.SampleChOut -- ^the output end of the sample chan/queue, to consume
+                  -> Common.SampleChCountTVar -- ^queued count
                   -> SDL.AudioFormat s -- ^SDL Audio Format identifier
                   -> SMV.IOVector s -- ^SDL-side vector to write samples to
                   -> IO ()
-sdlAudioCallback cm sampChO queuedCountMV sdlAudioFormat sdlAudioBuffer = case sdlAudioFormat of
+sdlAudioCallback cm sampChO queuedCountTV sdlAudioFormat sdlAudioBuffer = case sdlAudioFormat of
   -- need to match on this because it's a GADT constructor that instantiates a sample type s
-  SDL.Signed16BitLEAudio -> loop 0 *> modifyMVar_ queuedCountMV (\(!qc) -> pure (qc - realBufLen))
-    where
-      -- if stereo, realBufLen is 2x the specifiedBufferSize specified to SDL openAudioDevice
-      realBufLen = SMV.length sdlAudioBuffer
-      writeit :: Int -> IO ()
-      writeit ii = UU.readChan sampChO >>= SMV.write sdlAudioBuffer ii
-      -- loop thru indices i and fill the buffer
-      loop :: Int -> IO ()
-      loop i = if i >= realBufLen then pure () else case cm of
-        Stereo -> writeit i *> writeit (i + 1) *> loop (i + 2)
-        Mono -> writeit i *> loop (i + 1)
+  SDL.Signed16BitLEAudio -> let
+    realBufLen = SMV.length sdlAudioBuffer
+    writer = SMV.write sdlAudioBuffer
+    in Common.consumerLoop realBufLen cm sampChO queuedCountTV () writer
   _ -> putStrLn "Unsupported audio sample format"
 
 -- | Initialize SDL (the Audio subsystem only) given a sample rate, buffer size, and initial
--- node graph.
+-- node graph. Must do `closeAudio` afterwards; we expose `withAudio` which closes for you.
 openAudio :: SampleRate -> Word16 -> ChanMode -> e -> Node e (LR SampleVal) -> IO (HailstoneAudioHandle e)
-openAudio sampleRate specifiedBufferSize chanMode initEnv initNode = do
+openAudio sampleRate nSamplesPerBuffer chanMode initEnv initNode = do
   SDL.initialize [SDL.InitAudio]
   let sampleType = SDL.Signed16BitNativeAudio
       stereoMode = case chanMode of
@@ -130,8 +62,8 @@ openAudio sampleRate specifiedBufferSize chanMode initEnv initNode = do
       sink = fresh { _destNode = initNode }
 
   -- start the producer thread
-  (sampChO, queuedCountMV, replacementSinkMV, producerThreadId) <-
-    startProducer specifiedBufferSize chanMode sink
+  (sampChO, queuedCountTV, replacementSinkMV, producerThreadId) <-
+    Common.startProducer nSamplesPerBuffer chanMode sink
 
   -- function "requests" an audio spec from the hardware, using the requests/demands we
   -- specify in the Spec. It returns a spec, that has the true values that were provided,
@@ -141,8 +73,8 @@ openAudio sampleRate specifiedBufferSize chanMode initEnv initNode = do
     { SDL.openDeviceFreq = SDL.Mandate $ fromIntegral sampleRate
     , SDL.openDeviceFormat = SDL.Mandate sampleType
     , SDL.openDeviceChannels = SDL.Mandate stereoMode
-    , SDL.openDeviceSamples = specifiedBufferSize
-    , SDL.openDeviceCallback = sdlAudioCallback chanMode sampChO queuedCountMV
+    , SDL.openDeviceSamples = nSamplesPerBuffer
+    , SDL.openDeviceCallback = sdlAudioCallback chanMode sampChO queuedCountTV
     , SDL.openDeviceUsage = SDL.ForPlayback
     , SDL.openDeviceName = Nothing -- any output audio device will do
     }
@@ -165,9 +97,21 @@ closeAudio :: HailstoneAudioHandle e -> IO ()
 closeAudio hah = SDL.closeAudioDevice (_HAHsdlAudioDevice hah)
   *> killThread (_HAHproducerThreadId hah)
 
+-- | Run SDL audio given a sample rate, buffer size, channel mode, extra signal environment,
+-- initial node graph, and an IO action, and then terminate.
+withAudio :: SampleRate  -- ^sample rate
+          -> Word16 -- ^number of samples per buffer
+          -> ChanMode -- ^stereo or mono
+          -> e -- ^extra signal environment
+          -> Node e (LR SampleVal) -- ^node graph
+          -> (HailstoneAudioHandle e -> IO ()) -- ^IO actions given the handle (e.g. `enableAudio`)
+          -> IO ()
+withAudio sampleRate nSamplesPerBuffer chanMode initEnv initNode action =
+  bracket (openAudio sampleRate nSamplesPerBuffer chanMode initEnv initNode) action closeAudio
+
 -- | Play a new node graph.
-putNode :: HailstoneAudioHandle e -> e -> Node e (LR SampleVal) -> IO ()
-putNode hah newEnv newNode = do
+putNode :: e -> Node e (LR SampleVal) -> HailstoneAudioHandle e -> IO ()
+putNode newEnv newNode hah = do
   -- update the sample source (and reset the time counter), but don't change
   -- anything about the delta value
   let fresh = initSink (_HAHsampleRate hah) newEnv

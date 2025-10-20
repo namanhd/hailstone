@@ -17,19 +17,19 @@ module Sound.Hailstone.Synth
   -- needs; check `mkNode1` `mkNode3` for some derived constructors with other arities.
   --
   -- The audio node /tree/ can become an audio node /graph/ (a DAG, to be specific) with the
-  -- use of `cache`, which uses sorcery to enable /observable sharing/, letting the embedded
+  -- use of `share`, which uses sorcery to enable /observable sharing/, letting the embedded
   -- DSL see the sharing semantics, the let-bindings & usage of names, of the host language.
   Node(..)
   -- *** Convenient derived constructors
 , mkNode1, mkNode3
   -- ** Observable sharing
-, cache
+, share
   -- ** Consuming nodes at the audio backend
 , Sink(..), initSink, runNode, iterateNode
   -- ** Basic operators
 , (|+|), (|*|), (+|), (+||), (*|), (*||), accum, tick
   -- ** Numeric and stereo conversions
-, roundClip, asPCM, stereoize, stereoizeN, m2s
+, roundClip, asPCM, stereoize, stereoizeN, m2s, repan
   -- ** Sequencing
 , startAt, piecewiseMono, piecewisePoly, cascade
   -- *** Retriggering with `Cell`s
@@ -42,8 +42,9 @@ module Sound.Hailstone.Synth
 , sinOsc, sinOscP
   -- ** Effects
 , gain, gainN
+, echo, echoRaw, echo'
   -- *** Filters à la RBJ's audio EQ cookbook
-, lpf, lpfN
+, cookbookFilter, cookbookFilterN, lpf, lpfN
   -- * Re-exports
 , module Sound.Hailstone.Types
 )
@@ -54,7 +55,8 @@ import Data.Ord (clamp)
 import Data.List (sortOn)
 import Data.Functor ((<&>))
 import Sound.Hailstone.Types
-import Sound.Hailstone.VoiceAlloc (voiceAlloc)
+import qualified Sound.Hailstone.VoiceAlloc as VoiceAlloc
+import qualified Sound.Hailstone.DelayQueue as DelayQueue
 
 -- dark magic for observable sharing
 import System.IO.Unsafe (unsafePerformIO)
@@ -101,7 +103,7 @@ There are a number of design decisions here...
 - Q: This is a binary tree... One usually hears of audio graphs, not audio node trees. Is it
   possible to represent audio node graphs i.e. forking a node output to feed multiple nodes?
 
-    - A: With some cursed magic to implement __observable sharing__ in `cache`, yes. That is
+    - A: With some cursed magic to implement __observable sharing__ in `share`, yes. That is
       the general way to hijack the host language's sharing and make it manifest in the EDSL
       embedded within it, without having to make the DSL type a monad (which we don't have).
 
@@ -119,10 +121,14 @@ data Node e x where
   -- ^stateful nullary node, a source of values with no arguments needed.
   MkNode0_ :: !(SigEnv e -> x) -> Node e x
   -- ^stateless nullary node.
-  MkNode2 :: !s -> !(SigEnv e -> a -> b -> s -> SPair x s) -> !(Node e a) -> !(Node e b) -> Node e x
+  MkNode2 :: !s -> !(SigEnv e -> a -> b -> s -> SPair x s) -> ~(Node e a) -> ~(Node e b) -> Node e x
   -- ^stateful binary node, taking two argument nodes.
-  MkNode2_ :: !(SigEnv e -> a -> b -> x) -> !(Node e a) -> !(Node e b) -> Node e x
+  MkNode2_ :: !(SigEnv e -> a -> b -> x) -> ~(Node e a) -> ~(Node e b) -> Node e x
   -- ^stateless binary node.
+  MkNode0IO :: !s -> !(SigEnv e -> s -> IO (SPair x s)) -> Node e x
+  -- ^IO-effectful stateful nullary node. Use sparingly!
+  MkNode2IO :: !s -> !(SigEnv e -> a -> b -> s -> IO (SPair x s)) -> ~(Node e a) -> ~(Node e b) -> Node e x
+  -- ^IO-effectful stateful binary node. Use sparingly!
 
 instance Functor (Node e) where
   fmap f (MkNodeConst x) = MkNodeConst (f x)
@@ -134,6 +140,10 @@ instance Functor (Node e) where
     (\r a b s' -> let MkS2 x s'' = sig r a b s' in MkS2 (f x) s'') aNode bNode
   fmap f (MkNode2_ sig aNode bNode) = MkNode2_
     (\r a b -> f (sig r a b)) aNode bNode
+  fmap f (MkNode0IO s sig) = MkNode0IO s
+    (\r s' -> sig r s' <&> \(MkS2 x s'') -> MkS2 (f x) s'')
+  fmap f (MkNode2IO s sig aNode bNode) = MkNode2IO s
+    (\r a b s' -> sig r a b s' <&> \(MkS2 x s'') -> MkS2 (f x) s'') aNode bNode
   {-# INLINABLE fmap #-}
 
 instance Applicative (Node e) where
@@ -185,13 +195,13 @@ instance (Floating a) => Floating (Node e a) where
 
 -- | Constructor for a unary node, derived from `MkNode2`.
 mkNode1 :: s -> (SigEnv e -> a -> s -> SPair x s) -> Node e a -> Node e x
-mkNode1 s sig node = MkNode2 s (\r a _ -> sig r a) node (pure ())
+mkNode1 s sig = MkNode2 s (\r _ a -> sig r a) (pure ())
 {-# INLINABLE mkNode1 #-}
 
 -- | Constructor for a ternary node, derived from `MkNode2`. (This pattern of tupling up arg
 -- nodes can be extended indefinitely to higher arities if we ever need them.)
 mkNode3 :: s -> (SigEnv e -> a -> b -> c -> s -> SPair x s) -> Node e a -> Node e b -> Node e c -> Node e x
-mkNode3 s sig aNode bNode = MkNode2 s (\r (MkS2 a b) -> sig r a b) $ liftA2 MkS2 aNode bNode
+mkNode3 s sig ~aNode ~bNode = MkNode2 s (\r (MkS2 a b) -> sig r a b) (liftA2 MkS2 aNode bNode)
 {-# INLINABLE mkNode3 #-}
 
 --------------------------------------------------------------------------------
@@ -207,7 +217,7 @@ mkNode3 s sig aNode bNode = MkNode2 s (\r (MkS2 a b) -> sig r a b) $ liftA2 MkS2
 -- new value of @t@).
 --
 -- BEWARE: a tree node \"shadowed\" by a never-miss cache lookup due to a copy of itself run
--- before it in the depth-first (postorder) tree walk will /never/ get its state updated, as
+-- before it in the depth-first (postorder) tree walk will /never/ get any state updated, as
 -- it is never actually /evaluated/, and state is not part of the value being cached.
 --
 -- This does not matter, because they nonetheless always yield the right value thanks to the
@@ -217,75 +227,71 @@ mkNode3 s sig aNode bNode = MkNode2 s (\r (MkS2 a b) -> sig r a b) $ liftA2 MkS2
 --
 -- CAVEAT: this has a bit of overhead (`unsafePerformIO` and the `IORef` both incur a cost),
 -- though it will be beneficial for most nontrivial nodes and especially ones that are piped
--- into many other nodes as arguments. Do profiling to inform judgment of whether `cache` is
+-- into many other nodes as arguments. Do profiling to inform judgment of whether `share` is
 -- helping or not, because it can be non-obvious.
 --
 -- See [reactive-banana's writeup](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md)
 -- and [implementation](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/src/Reactive/Banana/Prim/High/Cached.hs)
 -- of this approach (observable sharing had been described in papers prior.)
-cache :: Node e x -> Node e x
-cache me@(MkNodeConst _) = me
-cache node = unsafePerformIO $ newIORef Nothing <&> \ref -> case node of
-  MkNode0 s sig -> MkNode0 s $ \r@(!t, _, _) s' -> let
-    -- we rely on runit being lazy so that we write the ref only when the cache misses
-    ~runit = let MkS2 x new_s = sig r s' in writeIORef ref (Just (MkS2 t x)) *> pure (MkS2 x new_s)
-    in unsafePerformIO $ readIORef ref >>= \case
-      Just (MkS2 tc xc) -> if tc == t then pure (MkS2 xc s') else runit
+share :: Node e x -> Node e x
+share me@(MkNodeConst _) = me
+share ~node = unsafePerformIO $ newIORef Nothing <&> \ref -> MkNode0IO Nothing $
+  \r@(!t, _, _) ~maybeMyNode -> let
+    ~runit = runNode r (maybe node id maybeMyNode) >>= \(MkS2 x new_node) ->
+      writeIORef ref (Just (MkS2 t x)) *> pure (MkS2 x (Just new_node))
+    -- on cache miss, run (either the original node or our saved current version of it) then
+    -- cache the result, then return it, and save (Just new_node) as our new saved state. If
+    -- the cache hits, then the cache ALWAYS hits, because we come after the 1st instance of
+    -- this shared node in the tree, our node state is always Nothing, runit never runs, and
+    -- thereby guaranteeing that ONLY 1 copy of the shared node's tree is stored anywhere in
+    -- the final tree.
+    in readIORef ref >>= \case
+      Just (MkS2 tc xc) -> if tc == t then pure (MkS2 xc maybeMyNode) else runit
       Nothing -> runit
-  MkNode0_ sig -> MkNode0_ $ \r@(!t, _, _) -> let
-    ~runit = let x = sig r in writeIORef ref (Just (MkS2 t x)) *> pure x
-    in unsafePerformIO $ readIORef ref >>= \case
-      Just (MkS2 tc xc) -> if tc == t then pure xc else runit
-      Nothing -> runit
-  MkNode2 s sig aNode bNode -> MkNode2 s (\r@(!t, _, _) a b s' -> let
-    ~runit = let (MkS2 x new_s) = sig r a b s' in writeIORef ref (Just (MkS2 t x)) *> pure (MkS2 x new_s)
-    in unsafePerformIO $ readIORef ref >>= \case
-      Just (MkS2 tc xc) -> if tc == t then pure (MkS2 xc s') else runit
-      Nothing -> runit
-    ) aNode bNode
-  MkNode2_ sig aNode bNode -> MkNode2_ (\r@(!t, _, _) a b -> let
-    ~runit = let x = sig r a b in writeIORef ref (Just (MkS2 t x)) *> pure x
-    in unsafePerformIO $ readIORef ref >>= \case
-      Just (MkS2 tc xc) -> if tc == t then pure xc else runit
-      Nothing -> runit
-    ) aNode bNode
-{-# NOINLINE cache #-}
+{-# NOINLINE share #-}
 
 --------------------------------------------------------------------------------
 -- ** Consuming nodes at the audio backend
 
 -- | Run the audio node tree one step, given a signal environment. Returns the emitted value
 -- and an updated tree (with the new node states as returned by the signal functions).
-runNode :: SigEnv e -> Node e x -> SPair x (Node e x)
+runNode :: SigEnv e -> Node e x -> IO (SPair x (Node e x))
 runNode r node = case node of
-  MkNodeConst x -> MkS2 x node
-  MkNode0_ sig  -> MkS2 (sig r) node
+  MkNodeConst x -> pure $ MkS2 x node
+  MkNode0_ sig  -> pure $ MkS2 (sig r) node
   MkNode0 s sig -> let
     (MkS2 x new_s) = sig r s
-    in MkS2 x (MkNode0 new_s sig)
-  MkNode2 s sig aNode bNode -> let
-    (MkS2 a new_aNode) = runNode r aNode
-    (MkS2 b new_bNode) = runNode r bNode
-    (MkS2 x new_s) = sig r a b s
-    in MkS2 x (MkNode2 new_s sig new_aNode new_bNode)
-  MkNode2_ sig aNode bNode -> let
-    (MkS2 a new_aNode) = runNode r aNode
-    (MkS2 b new_bNode) = runNode r bNode
-    x = sig r a b
-    in MkS2 x (MkNode2_ sig new_aNode new_bNode)
+    in pure $ MkS2 x (MkNode0 new_s sig)
+  MkNode0IO s sig -> do
+    (MkS2 x new_s) <- sig r s
+    pure $ MkS2 x (MkNode0IO new_s sig)
+  MkNode2 s sig aNode bNode -> do
+    (MkS2 a new_aNode) <- runNode r aNode
+    (MkS2 b new_bNode) <- runNode r bNode
+    let (MkS2 x new_s) = sig r a b s
+    pure $ MkS2 x (MkNode2 new_s sig new_aNode new_bNode)
+  MkNode2_ sig aNode bNode -> do
+    (MkS2 a new_aNode) <- runNode r aNode
+    (MkS2 b new_bNode) <- runNode r bNode
+    let x = sig r a b
+    pure $ MkS2 x (MkNode2_ sig new_aNode new_bNode)
+  MkNode2IO s sig aNode bNode -> do
+    (MkS2 a new_aNode) <- runNode r aNode
+    (MkS2 b new_bNode) <- runNode r bNode
+    (MkS2 x new_s) <- sig r a b s
+    pure $ MkS2 x (MkNode2IO new_s sig new_aNode new_bNode)
 
 -- | Queries a node @n@ times given the signal environment and a `SigEnv`-stepping function.
 -- This gives a very simple way to sample the node tree and produce an array of samples, but
 -- a list probably won't be very fast for downstream uses.
-iterateNode :: SigEnv e -> (SigEnv e -> SigEnv e) -> Int -> Node e x -> SPair [x] (Node e x)
-iterateNode r stepper n node = if n <= 0 then MkS2 [] node else let
-  (MkS2 x nodeNext) = runNode r node
-  (MkS2 xs nodeFinal) = iterateNode (stepper r) stepper (pred n) nodeNext
-  in MkS2 (x : xs) nodeFinal
+iterateNode :: SigEnv e -> (SigEnv e -> SigEnv e) -> Int -> Node e x -> IO (SPair [x] (Node e x))
+iterateNode r stepper n node = if n <= 0 then pure $ MkS2 [] node else do
+  (MkS2 x nodeNext) <- runNode r node
+  (MkS2 xs nodeFinal) <- iterateNode (stepper r) stepper (pred n) nodeNext
+  pure $ MkS2 (x : xs) nodeFinal
 
--- | A convenience state type for an audio backend to save. getDestNode, getCurrTime usually
--- are what gets consumed and updated every time a sample is queried from the node tree, tho
--- the specifics of how this will be consumed and samples written will be up to the backend.
+-- | A convenience state type for an audio backend to save. The audio backend is responsible
+-- for consuming @_destNode@ and stepping/updating the @_sigEnv@ (to new time values.)
 data Sink e =
   MkSink  { _destNode :: !(Node e (LR SampleVal))
           , _sigEnv :: !(TimeVal, TimeVal, e)
@@ -374,14 +380,16 @@ infixr 8 *||
 -- modify deltaTime. (If only we could find the derivative automatically?)
 modifyTime :: (TimeVal -> TimeVal) -> (TimeVal -> TimeVal) -> Node e a -> Node e a
 modifyTime f df node = case node of
+  (MkNodeConst _) -> node
   (MkNode0 s sig) -> MkNode0 s (sfgo sig)
   (MkNode0_ sig) -> MkNode0_ (sfgo sig)
+  (MkNode0IO s sig) -> MkNode0IO s (sfgo sig)
   -- must recursively modify time for the child nodes too since our signal function concerns
   -- only ourselves; the child nodes are evaluated before we are.
   -- TODO a bool on child nodes to enable/disable modifyTime recurse?
   (MkNode2 s sig aNode bNode) -> MkNode2 s (sfgo sig) (modifyTime f df aNode) (modifyTime f df bNode)
   (MkNode2_ sig aNode bNode) -> MkNode2_ (sfgo sig) (modifyTime f df aNode) (modifyTime f df bNode)
-  constNode -> constNode
+  (MkNode2IO s sig aNode bNode) -> MkNode2IO s (sfgo sig) (modifyTime f df aNode) (modifyTime f df bNode)
   where
     sfgo :: (SigEnv e -> a) -> SigEnv e -> a
     sfgo sig (!t, !d, e) = sig (f t, df d, e)
@@ -389,11 +397,11 @@ modifyTime f df node = case node of
 -- | Have a node start emitting at a start time (and possibly end after some duration), else
 -- emitting a default empty value outside the allowed timespan.
 startAt :: a -> TimeVal -> TimeVal -> Node e a -> Node e a
-startAt empt sta du node' = let s = modifyTime (subtract sta) id node'
-  in MkNode0 s $ \r@(!t, _, _) node -> if
-    | t < sta -> MkS2 empt node
+startAt empt sta du ~node' = let s = modifyTime (subtract sta) id node'
+  in MkNode0IO s $ \r@(!t, _, _) node -> if
+    | t < sta -> pure $ MkS2 empt node
     | t < (sta + du) -> runNode r node
-    | otherwise -> MkS2 empt node
+    | otherwise -> pure $ MkS2 empt node
 
 --------------------------------------------------------------------------------
 -- ** Numeric and stereo conversions
@@ -416,21 +424,26 @@ asPCM = roundClip . (*|) (fromIntegral (maxBound :: SampleVal))
 stereoize :: (Num a) => a -> Either (Node e a) (Node e (LR a)) -> Node e (LR a)
 {-# SPECIALIZE stereoize :: Pan -> Either (Node e SynthVal) (Node e (LR SynthVal)) -> Node e (LR SynthVal) #-}
 stereoize p (Left monoNode) = monoNode <&> \a -> MkLR ((1 - p) * a) (p * a)
-stereoize p (Right stereoNode) = stereoNode <&> \(MkLR !al !ar) ->
-  let a = al + ar in MkLR ((1 - p) * a) (p * a)
+stereoize p (Right stereoNode) = stereoNode <&> repanLR p
 
 -- | The node-parameterized version of `stereoize`, where pan values may be from a node and
 -- not constant.
 stereoizeN :: (Num a) => Node e a -> Either (Node e a) (Node e (LR a)) -> Node e (LR a)
 {-# SPECIALIZE stereoizeN :: Node e Pan -> Either (Node e SynthVal) (Node e (LR SynthVal)) -> Node e (LR SynthVal) #-}
 stereoizeN panNode (Left monoNode) = liftA2 (\p a -> MkLR ((1 - p) * a) (p * a)) panNode monoNode
-stereoizeN panNode (Right stereoNode) = liftA2 (\p (MkLR !al !ar) ->
-  let a = al + ar in MkLR ((1 - p) * a) (p * a)) panNode stereoNode
+stereoizeN panNode (Right stereoNode) = liftA2 repanLR panNode stereoNode
 
 -- | mono2stereo. Convenience to turn a mono real-valued signal into a stereo signal.
 m2s :: (Fractional a) => Node e a -> Node e (LR a)
 {-# SPECIALIZE m2s :: Node e SynthVal -> Node e (LR SynthVal) #-}
 m2s = stereoize 0.5 . Left
+{-# INLINABLE m2s #-}
+
+-- | Applies a different pan to an already stereo node.
+repan :: (Fractional a) => a -> Node e (LR a) -> Node e (LR a)
+{-# SPECIALIZE repan :: Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
+repan = fmap . repanLR
+{-# INLINABLE repan #-}
 
 --------------------------------------------------------------------------------
 -- ** Sequencing
@@ -452,18 +465,18 @@ piecewiseMono t0 empt nodesDurs = out
   -- get initial state and form the output node
   out = case nodesDurs' of
     [] -> pure empt
-    ((!firstNode, !firstStart, !firstDur):restNodes) -> MkNode0
+    ((firstNode, !firstStart, !firstDur):restNodes) -> MkNode0IO
       (firstNode, firstStart, firstDur, restNodes) gogo
   -- the state function for the node. check the start time of the next node and switch to it
   -- and consume one node from the list if its time is here, otherwise just keep playing the
   -- current node
-  gogo r@(!t, _, _) (!currNode, !currStart, !currDur, nil@[]) = let
-    MkS2 x new_currNode = if t < currStart + currDur then runNode r currNode else MkS2 empt currNode
-    in MkS2 x (new_currNode, currStart, currDur, nil)
+  gogo r@(!t, _, _) (currNode, !currStart, !currDur, nil@[]) = do
+    (MkS2 x new_currNode) <- if t < currStart + currDur then runNode r currNode else pure $ MkS2 empt currNode
+    pure $ MkS2 x (new_currNode, currStart, currDur, nil)
   gogo r@(!t, _, _) s@(currNode, !currStart, currDur, ls@((nextNode, !nextStart, nextDur):rest))
-    | t < currStart = MkS2 empt s
-    | t < nextStart = let (MkS2 x new_currNode) = runNode r currNode in MkS2 x (new_currNode, currStart, currDur, ls)
-    | otherwise = nextNode `seq` nextStart `seq` nextDur `seq` rest `seq`
+    | t < currStart = pure $ MkS2 empt s
+    | t < nextStart = runNode r currNode <&> \(MkS2 x new_currNode) -> MkS2 x (new_currNode, currStart, currDur, ls)
+    | otherwise = nextStart `seq` nextDur `seq` rest `seq`
       gogo r (nextNode, nextStart, nextDur, rest)
 
 -- | Sequence nodes together polyphonically (i.e. with many voices so that nodes overlapping
@@ -479,7 +492,7 @@ piecewisePoly :: Num a
               -- ^a list of @[(node, start, duration)]@.
               -> Node e a
 {-# SPECIALIZE piecewisePoly :: TimeVal -> LR SynthVal -> [(Node e (LR SynthVal), TimeVal, TimeVal)] -> Node e (LR SynthVal) #-}
-piecewisePoly t0 empt = sum . fmap (piecewiseMono t0 empt) . voiceAlloc
+piecewisePoly t0 empt = sum . fmap (piecewiseMono t0 empt) . VoiceAlloc.voiceAlloc
 
 -- | A far less efficient way to do `piecewisePoly`, just summing up all the nodes once they
 -- have been individually shifted on the timeline. This implies all nodes are always playing
@@ -508,7 +521,7 @@ data RetriggerMode = RetrigMonophonic | RetrigPolyphonic
 -- | Render a `Cell` into a `Node` of `LiveCell`. This is where we'll do \"effect commands\"
 -- on cells by rendering them into a `Node` of time-varying freq/ampl/env/pan parameters.
 renderCell :: Cell -> Node e LiveCell
-renderCell cell = cache $ adsrEnvelope cell.adsr <&> \currEnvValue -> MkLC
+renderCell cell = share $ adsrEnvelope cell.adsr <&> \currEnvValue -> MkLC
   { freq = cell.freq
   , ampl = cell.ampl
   , pan = cell.pan
@@ -532,12 +545,12 @@ retriggerWith envCellDurMode retrigMode t0 empt instrument cells = out
   where
     out = case retrigMode of
       RetrigMonophonic -> piecewiseMono t0 empt $ sortOn (\(_, sta, _) -> sta) nodesDurs
-      RetrigPolyphonic -> cache $ piecewisePoly t0 empt nodesDurs
-    nodesDurs = cells <&> \cell -> let
+      RetrigPolyphonic -> share $ piecewisePoly t0 empt nodesDurs
+    ~nodesDurs = cells <&> \cell -> let
       du = case envCellDurMode of
         EnvelopeIgnoresCellDuration -> max (adsrTotalTime cell.adsr) cell.dur
         EnvelopeCutsAtCellDuration -> cell.dur
-      node = instrument $ renderCell cell
+      ~node = instrument $ renderCell cell
       in (node, cell.start, du)
 
 --------------------------------------------------------------------------------
@@ -576,7 +589,7 @@ adsrEnvelope (ADSR tA tD tS tR v0 v1 v2) = let
     | t < t0R = v1
     | t < tEnd = v1 + (t - t0R) * dR
     | otherwise = v2
-  in cache $ MkNode0_ sig
+  in share $ MkNode0_ sig
 
 -- | Convenience shorthand for `adsrEnvelope` on an `ADSR` literal.
 nADSR :: TimeVal -> TimeVal -> TimeVal -> TimeVal -> SynthVal -> SynthVal -> SynthVal -> Node e SynthVal
@@ -675,12 +688,12 @@ nGain2ampl g = fmap (10.0 **) (0.05 *| g)
 
 -- | Apply constant gain (given in dB) to a node.
 gain :: Floating a => a -> Node e a -> Node e a
-gain g node = let a = gain2ampl g in a *| node
+gain g ~node = let a = gain2ampl g in a *| node
 {-# INLINABLE gain #-}
 
 -- | Apply variable gain (given in dB, emitted from a node) to a node.
 gainN :: Floating a => Node e a -> Node e a -> Node e a
-gainN g node = let a = nGain2ampl g in a * node
+gainN g ~node = let a = nGain2ampl g in a * node
 {-# INLINABLE gainN #-}
 
 -- *** Filters à la RBJ's EQ cookbook
@@ -696,8 +709,26 @@ _cookbookFilter_nanCoeffs = MkCFCoeffs nan nan nan nan nan nan
 _cookbookFilter_zeroState :: CookbookFilterState
 _cookbookFilter_zeroState = MkCFState 0 0 0 0 0 0
 
-_cookbookFilter_makeLPFcoeffs :: TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs
-_cookbookFilter_makeLPFcoeffs d q f = let
+_cookbookFilter_s0 :: SPair CookbookFilterCoeffs CookbookFilterState
+_cookbookFilter_s0 = MkS2 _cookbookFilter_nanCoeffs _cookbookFilter_zeroState
+
+_cookbookFilterN_s0 :: STriple Freq CookbookFilterCoeffs CookbookFilterState
+_cookbookFilterN_s0 = MkS3 nan _cookbookFilter_nanCoeffs _cookbookFilter_zeroState
+
+_cookbookFilter_SF :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> SigEnv e -> LR SynthVal -> SPair CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (SPair CookbookFilterCoeffs CookbookFilterState)
+_cookbookFilter_SF coeffsFn q f (_, d, _) x (MkS2 savedCoeffs savedState) = let
+  c = if isNaN savedCoeffs._a0inv then coeffsFn d q f else savedCoeffs
+  s = _cookbookFilter_fn c savedState x
+  in MkS2 s._ym0 (MkS2 c s)
+
+_cookbookFilterN_SF :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> SigEnv e -> Freq -> LR SynthVal -> STriple Freq CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (STriple Freq CookbookFilterCoeffs CookbookFilterState)
+_cookbookFilterN_SF coeffsFn q (_, d, _) thisFreq x (MkS3 lastFreq savedCoeffs savedState) = let
+  c = if thisFreq == lastFreq then savedCoeffs else coeffsFn d q thisFreq
+  s = _cookbookFilter_fn c savedState x
+  in MkS2 s._ym0 (MkS3 thisFreq c s)
+
+cookbookCoeffsFn_LPF :: TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs
+cookbookCoeffsFn_LPF d q f = let
   omega = twopi * f * d
   cosom = cos omega
   sinom = sin omega
@@ -712,20 +743,55 @@ _cookbookFilter_makeLPFcoeffs d q f = let
     , _b2 = b0
     }
 
--- | 2nd-order low pass filter, given constant Q factor and cutoff frequency.
--- https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
+-- | RBJ 2nd-order filter. https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
+-- Takes a coefficients-calculating function (which itself takes delta time, Q, frequency.)
+cookbookFilter :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+cookbookFilter coeffsFn q f = mkNode1 _cookbookFilter_s0 (_cookbookFilter_SF coeffsFn q f)
+
+-- | `cookbookFilter` but with variable filter frequency from a node.
+cookbookFilterN :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Node e Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+cookbookFilterN coeffsFn q = MkNode2 _cookbookFilterN_s0 (_cookbookFilterN_SF coeffsFn q)
+
+-- | 2nd-order low-pass filter.
 lpf :: SynthVal -> Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-lpf q f = mkNode1 (MkS2 _cookbookFilter_nanCoeffs _cookbookFilter_zeroState) $
-  \(_, d, _) x (MkS2 savedCoeffs savedState) -> let
-    c = if isNaN savedCoeffs._a0inv then _cookbookFilter_makeLPFcoeffs d q f else savedCoeffs
-    s = _cookbookFilter_fn c savedState x
-    in MkS2 s._ym0 (MkS2 c s)
+lpf = cookbookFilter cookbookCoeffsFn_LPF
 
--- | `lpf` but with variable cutoff frequency.
+-- | `lpf` but with variable filter frequency.
 lpfN :: SynthVal -> Node e Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-lpfN q = MkNode2 (MkS3 nan _cookbookFilter_nanCoeffs _cookbookFilter_zeroState) $
-  \(_, d, _) thisFreq x (MkS3 lastFreq savedCoeffs savedState) -> let
-    c = if thisFreq == lastFreq then savedCoeffs else _cookbookFilter_makeLPFcoeffs d q thisFreq
-    s = _cookbookFilter_fn c savedState x
-    in MkS2 s._ym0 (MkS3 thisFreq c s)
+lpfN = cookbookFilterN cookbookCoeffsFn_LPF
 
+-- *** Delay, echo
+
+-- | Single-stream echo with constant delay time, decay multiplier, wet mix level (0-1), low
+-- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
+--
+-- (More efficient, fused implementation of `echo`.)
+echo' :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+echo' delayMs decayMult wetLvl filterQ filterF wetPan = let delaySec = delayMs * 0.001; dryLvl = max 0 (1 - wetLvl)
+  in flip (MkNode2IO (MkS2 DelayQueue.dummy _cookbookFilter_s0)) (pure ()) $ \r@(_, d, _) _ x (MkS2 savedDQ filterState) -> do
+    dq <- DelayQueue.unDummy (round $ delaySec / d) 0 savedDQ
+    delayOut <- DelayQueue.pop 0 dq
+    let delayIn = x + (decayMult .*: delayOut)
+    DelayQueue.push delayIn dq
+    let (MkS2 filteredDelayOut filterState') = _cookbookFilter_SF cookbookCoeffsFn_LPF filterQ filterF r delayOut filterState
+    pure $ MkS2 ((dryLvl .*: x) + repanLR wetPan (wetLvl .*: filteredDelayOut)) (MkS2 dq filterState')
+
+-- | Single-stream echo with constant delay time and decay multiplier. This produces the raw
+-- echo wet signal; do your own mixing and filtering afterwards (or use `echo`.)
+echoRaw :: TimeVal -> Ampl -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+echoRaw delayMs decayMult = let delaySec = delayMs * 0.001
+  in flip (MkNode2IO DelayQueue.dummy) (pure ()) $ \(_, d, _) _ x savedDQ -> do
+    dq <- DelayQueue.unDummy (round $ delaySec / d) 0 savedDQ
+    delayOut <- DelayQueue.pop 0 dq
+    let delayIn = x + (decayMult .*: delayOut)
+    DelayQueue.push delayIn dq
+    pure $ MkS2 delayOut dq
+
+-- | Single-stream echo with constant delay time, decay multiplier, wet mix level (0-1), low
+-- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
+echo :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+echo delayMs decayMult wetLvl filterQ filterF wetPan input = output
+  where
+    input' = share input
+    filteredDelayOut = lpf filterQ filterF $ echoRaw delayMs decayMult input'
+    output = (1 - wetLvl) *|| input' + (repan wetPan $ wetLvl *|| filteredDelayOut)

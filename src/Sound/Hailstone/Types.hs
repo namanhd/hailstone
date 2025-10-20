@@ -1,6 +1,6 @@
 {-# LANGUAGE Strict #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
-{-# LANGUAGE OverloadedRecordDot, DuplicateRecordFields, BangPatterns #-}
+{-# LANGUAGE OverloadedRecordDot, DuplicateRecordFields, BangPatterns, ScopedTypeVariables #-}
 
 module Sound.Hailstone.Types
 ( -- * Type synonyms and datatypes
@@ -13,7 +13,7 @@ module Sound.Hailstone.Types
 , STriple(..)
   -- *** Strict stereo pair
 , LR(..)
-, dupLR, (.+:), (.*:)
+, dupLR, (.+:), (.*:), repanLR
   -- ** Integer types
 , SampleRate, SampleVal
   -- ** Note data & config
@@ -28,6 +28,7 @@ module Sound.Hailstone.Types
 ) where
 
 import Data.Int (Int16)
+import Foreign (Storable, castPtr, peek, poke, pokeElemOff, peekElemOff, sizeOf, alignment)
 
 -- | Shared number type for all calculations in synthesis functions.
 type SynthVal = Double
@@ -144,6 +145,27 @@ instance Applicative LR where
   liftA2 f (MkLR al ar) (MkLR bl br) = MkLR (f al bl) (f ar br)
   {-# INLINABLE liftA2 #-}
 
+instance Foldable LR where
+  foldr f b (MkLR al ar) = f ar (f al b)
+  {-# INLINE foldr #-}
+
+instance Traversable LR where
+  sequenceA (MkLR al ar) = liftA2 MkLR al ar
+  {-# INLINE sequenceA #-}
+
+instance Storable a => Storable (LR a) where
+  sizeOf = const $ 2 * sizeOf (undefined :: a)
+  alignment = const $ alignment (undefined :: a)
+  peek ptr = do
+    q <- pure $ castPtr ptr
+    al <- peek q
+    ar <- peekElemOff q 1
+    pure (MkLR al ar)
+  poke ptr (MkLR al ar)  = do
+    q <- pure $ castPtr ptr
+    poke q al
+    pokeElemOff q 1 ar
+
 -- | Trivially make a mono value into a stereo value.
 dupLR :: a -> LR a
 dupLR a = MkLR a a
@@ -156,6 +178,11 @@ a .+: (MkLR l r) = (MkLR (a + l) (a + r))
 -- | Scale an `LR` by a scalar.
 (.*:) :: Num a => a -> LR a -> LR a
 a .*: (MkLR l r) = (MkLR (a * l) (a * r))
+
+-- | Pans an `LR` by a pan value (hard right is 1.0, hard left is 0.0)
+repanLR :: Num a => a -> LR a -> LR a
+{-# SPECIALIZE repanLR :: Pan -> LR SynthVal -> LR SynthVal #-}
+repanLR p (MkLR !al !ar) = let a = al + ar in MkLR ((1 - p) * a) (p * a)
 
 instance (Num a) => Num (LR a) where
   (+) = liftA2 (+)

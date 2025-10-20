@@ -1,38 +1,48 @@
-name:                hailstone
-version:             0.1.0.0
-synopsis:            haskell audio synthesis + music composition
--- description:
-homepage:            https://github.com/namanhd/hailstone
-license:             MIT
-license-file:        LICENSE
-author:              namanh
-maintainer:          namanh@uchicago.edu
-copyright:           2021 namanh
-category:            Sound
-build-type:          Simple
-cabal-version:       >=1.10
--- extra-source-files:  README.md
+name:                 hailstone
+version:              0.1.0.0
+synopsis:             audio synthesis + music composition
+homepage:             https://github.com/namanhd/hailstone
+license:              MIT
+license-file:         LICENSE
+author:               namanh
+copyright:            2025 namanh
+category:             Sound
+build-type:           Simple
+cabal-version:        >=1.10
+
+flag audio-backend-sdl
+  description:        The default audio backend is PortAudio (smaller dependency footprint).
+                      Enable this to compile the executable with SDL audio as the backend.
+  default:            False
+  manual:             True
+  -- manual: True means cabal won't retry with the flag set to True if the build fails
 
 library
-  hs-source-dirs:    src
-  ghc-options:       -Wall -O3 -threaded
-  default-language:  Haskell2010
-  exposed-modules:   Sound.Hailstone.Synth
-                   , Sound.Hailstone.Types
-                   , Sound.Hailstone.VoiceAlloc
-  build-depends:     base >= 4.7 && < 5
+  hs-source-dirs:     src
+  ghc-options:        -Wall -O3 -threaded
+  default-language:   Haskell2010
+  exposed-modules:    Sound.Hailstone.Synth
+                    , Sound.Hailstone.Types
+  other-modules:      Sound.Hailstone.VoiceAlloc
+                    , Sound.Hailstone.DelayQueue
+  build-depends:      base >= 4.7 && < 5
+                    , array
 
-executable hailstone-sdltest
-  hs-source-dirs:      exe
-  main-is:             SDLTestMain.hs
-  other-modules:       Sound.Hailstone.Backends.SDLAudio
-  -- use the SDL audio backend
-  ghc-options:         -Wall -O3 -threaded -rtsopts -with-rtsopts "-N -maxN2 -H20m"
-  -- note that -threaded is required for anything that FFIs to SDL2, otherwise
-  -- it will segfault/crash horribly!
-  default-language:    Haskell2010
-  build-depends:       base >= 4.7 && < 5
-                     , hailstone
-                     , vector
-                     , unagi-chan
-                     , sdl2
+executable hailstone-scratch
+  hs-source-dirs:     exe
+  main-is:            ScratchMain.hs
+  other-modules:      Sound.Hailstone.Backends.Common
+  ghc-options:        -Wall -O3 -threaded -rtsopts -with-rtsopts "-N -maxN2 -H20m"
+  default-language:   Haskell2010
+  build-depends:      base >= 4.7 && < 5
+                    , hailstone
+                    , unagi-chan
+
+  if flag(audio-backend-sdl)
+    cpp-options:      -DHLSTN_AUDIO_BACKEND_SDL
+    other-modules:    Sound.Hailstone.Backends.SDLAudio
+    build-depends:    sdl2
+                    , vector
+  else
+    other-modules:    Sound.Hailstone.Backends.PortAudio
+    build-depends:    portaudio

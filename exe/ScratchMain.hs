@@ -1,11 +1,19 @@
 {-# LANGUAGE OverloadedRecordDot, Strict #-}
+{-# LANGUAGE CPP #-}
 -- Test main executable, for trying out songs and synths
 
 module Main where
 
 import Data.Functor ((<&>))
 import Sound.Hailstone.Synth
+
+-- the backends are interchangeable
+#ifdef HLSTN_AUDIO_BACKEND_SDL
 import Sound.Hailstone.Backends.SDLAudio
+#else
+import Sound.Hailstone.Backends.PortAudio
+#endif
+
 import Control.Concurrent (threadDelay)
 
 testSong :: [Cell]
@@ -70,9 +78,9 @@ testSynth0 lc = finalNode
 testSynth1 :: Node e LiveCell -> Node e (LR SynthVal)
 testSynth1 lc = finalNode
   where
-    f = cache $ lc <&> (.freq)
+    f = share $ lc <&> (.freq)
     a = lc <&> (.ampl)
-    e = cache $ lc <&> (.env) -- note envelope current value
+    e = share $ lc <&> (.env) -- note envelope current value
     -- pan = lc <&> (.pan)
     sinModulator3 = adsrEnvelope (ADSR 0.02 0.0 0.02 0.01 0.0 1.0 1.0) * sinOsc e (5 *| f)
     fWithVibrato = (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
@@ -82,11 +90,11 @@ testSynth1 lc = finalNode
 testSynth2 :: Node e LiveCell -> Node e (LR SynthVal)
 testSynth2 lc = finalNode
   where
-    f = cache $ lc <&> (.freq)
-    a = cache $ lc <&> (.ampl)
-    e = cache $ lc <&> (.env) -- note envelope current value
+    f = share $ lc <&> (.freq)
+    a = share $ lc <&> (.ampl)
+    e = share $ lc <&> (.env) -- note envelope current value
     -- also apply a pitch envelope on top of vibrato
-    fWithVibrato = cache $ nADSR 0.01 0.0 0.05 0.01 0.0 1.0 1.0 * (f * (1 +| sinOsc 0.02 5))
+    fWithVibrato = share $ nADSR 0.01 0.0 0.05 0.01 0.0 1.0 1.0 * (f * (1 +| sinOsc 0.02 5))
     sinModulator1 = e * nADSR  0.04 0.0 0.05 0.01 0.1 1.0 1.0 * sinOsc 0.7 (5 *| f)
     sinCarrier1 = sinOscP a fWithVibrato sinModulator1
     sinModulator2 = nADSR 0.0 0.0 0.0 0.07 1.0 1.0 0.0 * sinOsc 1.2 (6 *| f)
@@ -94,8 +102,8 @@ testSynth2 lc = finalNode
     finalNode = m2s $ e * (sinCarrier1 + sinCarrier2)
 
 
-tonetestmainSDL :: IO ()
-tonetestmainSDL = do
+tonetestmain :: IO ()
+tonetestmain = do
   let sampleRate = 44100
       bufferSize = 128
       chanMode = Stereo
@@ -105,26 +113,23 @@ tonetestmainSDL = do
     sec = 1000000
     playNotes synth notes = retriggerWith
       EnvelopeIgnoresCellDuration RetrigPolyphonic 0.0 0.0 synth notes
-    summedNode = playNotes testSynth2 testSong2
-    destNode = asPCM summedNode
+    mixed = playNotes testSynth2 testSong2
+    master = echo' 96 0.5 0.4 1.0 800 0.2 mixed
+    destNode = startAt 0 0.1 10 $ asPCM master
 
   putStrLn "Opening audio"
-  hah <- openAudio sampleRate bufferSize chanMode () destNode
+  withAudio sampleRate bufferSize chanMode () destNode $ \hah -> do
+    -- -- can replace node with
+    -- putNode hah () newDestNode
+    putStrLn "Waiting before play start"
+    putStrLn "Starting play"
+    enableAudio hah
 
-  -- -- can replace node with
-  -- putNode hah () newDestNode
+    let runDuration = 3.6 :: TimeVal
+    threadDelay (round $ runDuration * sec)
 
-  putStrLn "Waiting before play start"
-  threadDelay (round $ 0.12 * sec)
-  putStrLn "Starting play"
-  enableAudio hah
-
-  let runDuration = 3.5 :: TimeVal
-  threadDelay (round $ runDuration * sec)
-
-  putStrLn "Done waiting"
-  closeAudio hah
-  pure ()
+    putStrLn "Done waiting"
+    pure ()
 
 main :: IO ()
-main = tonetestmainSDL
+main = tonetestmain
