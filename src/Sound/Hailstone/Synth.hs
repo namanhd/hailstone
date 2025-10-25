@@ -6,6 +6,12 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 
+-- for HasField passthrough
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE PolyKinds #-} -- needed for the HasField instance to be usable, apparently
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module Sound.Hailstone.Synth
 ( -- * Audio nodes
   --
@@ -29,22 +35,22 @@ module Sound.Hailstone.Synth
   -- ** Basic operators
 , (|+|), (|*|), (+|), (+||), (*|), (*||), accum, tick
   -- ** Numeric and stereo conversions
-, roundClip, asPCM, stereoize, stereoizeN, m2s, repan
+, asPCM, stereodup, monosum, mono2stereo, stereo2mono, mapLRNode, balance
   -- ** Sequencing
 , startAt, piecewiseMono, piecewisePoly, cascade
   -- *** Retriggering with `Cell`s
 , EnvelopeCellDurationMode(..), RetriggerMode(..)
 , retriggerWith
   -- ** Envelopes
-, adsrEnvelope, adsrEnvelopeN, nADSR
+, adsr', adsr'N, adsr
 , funcRamp, linearRamp
   -- ** Generators
-, sinOsc, sinOscP
+, sinOsc, sinOscPM, sqrOsc, sqrOscDM, sawOsc, triOsc, triOscPM, sawOscSM
   -- ** Effects
 , gain, gainN
-, echo, echoRaw, echo'
+, echoRaw, echo, echo'
   -- *** Filters à la RBJ's audio EQ cookbook
-, cookbookFilter, cookbookFilterN, lpf, lpfN
+, lpf, lpfN
   -- * Re-exports
 , module Sound.Hailstone.Types
 )
@@ -61,6 +67,9 @@ import qualified Sound.Hailstone.DelayQueue as DelayQueue
 -- dark magic for observable sharing
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (newIORef, readIORef, writeIORef)
+
+-- for HasField passthrough
+import GHC.Records
 
 -- | A signal function needs access to the current time and the time delta between samplings
 -- (i.e. 1 / (samplerate)). We also take an external environment type @e@ along for the ride
@@ -190,6 +199,10 @@ instance (Floating a) => Floating (Node e a) where
   (**) = liftA2 (**)
   logBase = liftA2 logBase
 
+-- | So that @Node e LiveCell@ lifts record dot access for the inner `LiveCell` to `Node`.
+instance (HasField name r a) => HasField name (Node e r) (Node e a) where
+  getField = fmap (getField @name)
+
 --------------------------------------------------------------------------------
 -- *** Convenient derived constructors
 
@@ -300,22 +313,21 @@ data Sink e =
 -- | Initializing a `Sink` with a pure zero `Node`.
 initSink :: SampleRate -> e -> Sink e
 initSink sampleRate e =
-  MkSink  { _destNode = pure 0
+  MkSink  { _destNode = pure zeroLR
           , _sigEnv = (0.0, recip $ fromIntegral sampleRate, e)
           }
 
 --------------------------------------------------------------------------------
 -- ** Basic operators
 
--- | Generic accumulator node, with a `start` state plus an accumulator `accumFn`. The state
+-- | Generic accumulator node, with a starting state and an accumulating function. The state
 -- updates every time a value is emitted; the emitted value is that state.
 accum :: s -> (i -> s -> s) -> Node e i -> Node e s
-accum sta accumFn = mkNode1 sta $ \_ i s -> let s' = accumFn i s in MkS2 s' s'  -- sfArgs >>= \i -> modify (accumFn i) *> get
+accum sta accumFn = mkNode1 sta $ \_ i s -> let s' = accumFn i s in MkS2 s' s'
 
--- | Simple counter/ticker, from a `start` value and an `increment` from a node.  That state
--- is then emitted.
+-- | Simple counter with a starting count, accumulating new values received from a node.
 tick :: Num a => a -> Node e a -> Node e a
-tick sta = mkNode1 sta $ \_ i s -> MkS2 s (s + i)  --  sfArgs >>= \i -> state $ \s -> (s, s + i)
+tick sta = mkNode1 sta $ \_ i s -> MkS2 s (s + i)
 
 -- test stuff
 -- __testenv = (0.0 :: TimeVal, 1.0 :: TimeVal)
@@ -356,8 +368,11 @@ infixr 7 +|
 {-# INLINABLE (+|) #-}
 
 -- | Add to a stereo node a scalar addend.
-(+||) :: (Num a) => a -> Node e (LR a) -> Node e (LR a)
-{-# SPECIALIZE (+||) :: SynthVal -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
+(+||) :: SynthVal -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+-- (+||) :: (LRxNum a) => a -> Node e (LR a) -> Node e (LR a)
+-- {-# SPECIALIZE (+||) :: SynthVal -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
+-- LRxNum is too internal to Sound.Hailstone.Types.LR, we shouldn't be using it out here...
+-- better to just specialize it (as we've given (LR T) types specialized reprs anyway)
 (+||) addend = fmap (addend .+:)
 infixr 7 +||
 {-# INLINABLE (+||) #-}
@@ -370,8 +385,9 @@ infixr 8 *|
 {-# INLINABLE (*|) #-}
 
 -- | Scale a stereo node by a scalar multiplier.
-(*||) :: (Num a) => a -> Node e (LR a) -> Node e (LR a)
-{-# SPECIALIZE (*||) :: SynthVal -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
+(*||) :: SynthVal -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+-- (*||) :: (LRxNum a) => a -> Node e (LR a) -> Node e (LR a)
+-- {-# SPECIALIZE (*||) :: SynthVal -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
 (*||) multiplier = fmap (multiplier .*:)
 infixr 8 *||
 {-# INLINABLE (*||) #-}
@@ -407,43 +423,65 @@ startAt empt sta du ~node' = let s = modifyTime (subtract sta) id node'
 -- ** Numeric and stereo conversions
 
 -- | Round and clip a node's output to the bounds allowed by the sample format.
-roundClip :: (RealFrac v, Bounded samp, Ord samp, Integral samp) => Node e (LR v) -> Node e (LR samp)
-{-# SPECIALIZE roundClip :: Node e (LR SynthVal) -> Node e (LR SampleVal) #-}
-roundClip = fmap (fmap (\v -> min maxBound $ max minBound $ round v))
+roundClip :: Node e (LR SynthVal) -> Node e (LR SampleVal)
+-- roundClip :: (LRxNum v, RealFrac v, LRx samp, Bounded samp, Ord samp, Integral samp) => Node e (LR v) -> Node e (LR samp)
+-- {-# SPECIALIZE roundClip :: Node e (LR SynthVal) -> Node e (LR SampleVal) #-}
+roundClip = fmap $ mapLR $ \v -> round
+  $ min (fromIntegral (maxBound :: SampleVal))
+  $ max (fromIntegral (minBound :: SampleVal)) v
 
 -- | Convert a double-generating signal into a signal of sample values expected by our audio
 -- setup (here, @Int16@), with scaling up to sample values followed by rounding and clipping
-asPCM :: RealFrac v => Node e (LR v) -> Node e (LR SampleVal)
-{-# SPECIALIZE asPCM :: Node e (LR SynthVal) -> Node e (LR SampleVal) #-}
+asPCM :: Node e (LR SynthVal) -> Node e (LR SampleVal)
+-- asPCM :: (LRxNum v, RealFrac v) => Node e (LR v) -> Node e (LR SampleVal)
+-- {-# SPECIALIZE asPCM :: Node e (LR SynthVal) -> Node e (LR SampleVal) #-}
 asPCM = roundClip . (*|) (fromIntegral (maxBound :: SampleVal))
 
--- | Apply some panning to turn a mono signal into a stereo signal, or modify the panning of
--- an existing stereo signal. Note that pan values are from 0 to 1 where 0 is hard left, 0.5
--- is centered, and 1.0 is hard right.  (Though, no bounds checking is done to ensure this.)
--- See `stereoize` for a version where the pan value can be emitted from an argument `Node`.
-stereoize :: (Num a) => a -> Either (Node e a) (Node e (LR a)) -> Node e (LR a)
-{-# SPECIALIZE stereoize :: Pan -> Either (Node e SynthVal) (Node e (LR SynthVal)) -> Node e (LR SynthVal) #-}
-stereoize p (Left monoNode) = monoNode <&> \a -> MkLR ((1 - p) * a) (p * a)
-stereoize p (Right stereoNode) = stereoNode <&> repanLR p
+sqrt2over2 :: SynthVal
+sqrt2over2 = 0.5 * sqrt 2
 
--- | The node-parameterized version of `stereoize`, where pan values may be from a node and
--- not constant.
-stereoizeN :: (Num a) => Node e a -> Either (Node e a) (Node e (LR a)) -> Node e (LR a)
-{-# SPECIALIZE stereoizeN :: Node e Pan -> Either (Node e SynthVal) (Node e (LR SynthVal)) -> Node e (LR SynthVal) #-}
-stereoizeN panNode (Left monoNode) = liftA2 (\p a -> MkLR ((1 - p) * a) (p * a)) panNode monoNode
-stereoizeN panNode (Right stereoNode) = liftA2 repanLR panNode stereoNode
+-- | Turn a mono real-valued signal into a center-panned stereo signal.
+-- (using constant power pan law)
+mono2stereo :: Node e SynthVal -> Node e (LR SynthVal)
+mono2stereo = fmap (\a -> dupLR $ sqrt2over2 * a)
+{-# INLINABLE mono2stereo #-}
 
--- | mono2stereo. Convenience to turn a mono real-valued signal into a stereo signal.
-m2s :: (Fractional a) => Node e a -> Node e (LR a)
-{-# SPECIALIZE m2s :: Node e SynthVal -> Node e (LR SynthVal) #-}
-m2s = stereoize 0.5 . Left
-{-# INLINABLE m2s #-}
+stereo2mono :: Node e (LR SynthVal) -> Node e SynthVal
+stereo2mono = fmap (\a -> sqrt2over2 * hsumLR a)
+{-# INLINABLE stereo2mono #-}
 
--- | Applies a different pan to an already stereo node.
-repan :: (Fractional a) => a -> Node e (LR a) -> Node e (LR a)
-{-# SPECIALIZE repan :: Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
-repan = fmap . repanLR
-{-# INLINABLE repan #-}
+-- | Duplicate a mono real-valued signal into a stereo signal without pan scale adjustment
+stereodup :: Node e SynthVal -> Node e (LR SynthVal)
+stereodup = fmap dupLR
+{-# INLINABLE stereodup #-}
+
+-- | Sum left and right of a mono to trivially get a mono signal, without level adjustment.
+monosum :: Node e (LR SynthVal) -> Node e SynthVal
+monosum = fmap hsumLR
+{-# INLINABLE monosum #-}
+
+-- | Lift a function on mono nodes to become a function on stereo nodes
+mapLRNode :: (Node e SynthVal -> Node e SynthVal) -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+mapLRNode f lrNode = let
+  lrNode' = share lrNode
+  lNode = f $ fmap (\lr -> withLR lr $ \l _ -> l) lrNode'
+  rNode = f $ fmap (\lr -> withLR lr $ \_ r -> r) lrNode'
+  in liftA2 mkLR lNode rNode
+
+-- halfpi :: SynthVal
+-- halfpi = 0.5 * pi
+-- ! Turn a mono real-valued signal into a panned stereo signal.
+-- (Taxing! Use `mono2stereo` followed by `balance` instead.)
+-- mono2pan :: Pan -> Node e SynthVal -> Node e (LR SynthVal)
+-- mono2pan p = fmap (\a -> mkLR (a * cos (p * halfpi)) (a * sin (p * halfpi)))
+-- {-# INLINABLE mono2pan #-}
+
+-- | Applies a different pan value to rebalance a stereo node.
+balance :: Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+-- balance :: (LRxFrac a, Ord a) => a -> Node e (LR a) -> Node e (LR a)
+-- {-# SPECIALIZE balance :: Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
+balance = fmap . balanceLR
+{-# INLINABLE balance #-}
 
 --------------------------------------------------------------------------------
 -- ** Sequencing
@@ -521,7 +559,7 @@ data RetriggerMode = RetrigMonophonic | RetrigPolyphonic
 -- | Render a `Cell` into a `Node` of `LiveCell`. This is where we'll do \"effect commands\"
 -- on cells by rendering them into a `Node` of time-varying freq/ampl/env/pan parameters.
 renderCell :: Cell -> Node e LiveCell
-renderCell cell = share $ adsrEnvelope cell.adsr <&> \currEnvValue -> MkLC
+renderCell cell = share $ adsr' cell.adsr <&> \currEnvValue -> MkLC
   { freq = cell.freq
   , ampl = cell.ampl
   , pan = cell.pan
@@ -530,17 +568,15 @@ renderCell cell = share $ adsrEnvelope cell.adsr <&> \currEnvValue -> MkLC
 
 -- | Play a melody (a list of `Cell`) with a synth (a node parameterized by @`Node` `Freq`@,
 -- @`Node` `Ampl`@). Effectively \"resets and retriggers\" a node in sync with note data.
-retriggerWith :: (Num a)
-              => EnvelopeCellDurationMode
+retriggerWith :: EnvelopeCellDurationMode
                 -- ^how to treat envelope vs. cell duration, see docs for this type
               -> RetriggerMode -- ^monophonic or polyphonic triggering
               -> TimeVal -- ^a start time for this retriggering sequence
-              -> LR a -- ^empty value for when notes have concluded
-              -> (Node e LiveCell -> Node e (LR a))
+              -> LR SynthVal -- ^empty value for when notes have concluded
+              -> (Node e LiveCell -> Node e (LR SynthVal))
                 -- ^instrument to retrigger. An instrument is parameterized by `LiveCell`s.
               -> [Cell] -- ^note data cells making up the melody
-              -> Node e (LR a)
-{-# SPECIALIZE retriggerWith :: EnvelopeCellDurationMode -> RetriggerMode -> TimeVal -> LR SynthVal -> (Node e LiveCell -> Node e (LR SynthVal)) -> [Cell] -> Node e (LR SynthVal) #-}
+              -> Node e (LR SynthVal)
 retriggerWith envCellDurMode retrigMode t0 empt instrument cells = out
   where
     out = case retrigMode of
@@ -566,7 +602,7 @@ _funcRamp_fn f du sta end t = let
 
 -- | A ramp signal that increases from start to end (or possibly decreases) in a given range
 -- of time based on some given function, then holds. For linear ramping, the function should
--- be \t -> t; For a quadratic ramp, the function is \t -> t*t etc.
+-- be @\t -> t@; For a quadratic ramp, the function is @\t -> t*t@ etc.
 funcRamp :: (Num v, Ord v) => (TimeVal -> v) -> TimeVal -> v -> v -> Node e v
 funcRamp f du sta end = if du == 0 then pure end else nTime <&> _funcRamp_fn f du sta end
 
@@ -575,8 +611,8 @@ linearRamp :: TimeVal -> SynthVal -> SynthVal -> Node e SynthVal
 linearRamp = funcRamp id
 
 -- | Create a signal traversing an ADSR envelope according to some fixed envelope params.
-adsrEnvelope :: ADSRParams -> Node e SynthVal
-adsrEnvelope (ADSR tA tD tS tR v0 v1 v2) = let
+adsr' :: ADSRParams -> Node e SynthVal
+adsr' (ADSR tA tD tS tR v0 v1 v2) = let
   dA = (1.0 - v0) / tA
   dD = (v1 - 1.0) / tD
   t0S = tA + tD
@@ -591,10 +627,10 @@ adsrEnvelope (ADSR tA tD tS tR v0 v1 v2) = let
     | otherwise = v2
   in share $ MkNode0_ sig
 
--- | Convenience shorthand for `adsrEnvelope` on an `ADSR` literal.
-nADSR :: TimeVal -> TimeVal -> TimeVal -> TimeVal -> SynthVal -> SynthVal -> SynthVal -> Node e SynthVal
-nADSR tA tD tS tR v0 v1 v2 = adsrEnvelope $ ADSR tA tD tS tR v0 v1 v2
-{-# INLINABLE nADSR #-}
+-- | Convenience shorthand for `adsr'` on an `ADSR` literal.
+adsr :: TimeVal -> TimeVal -> TimeVal -> TimeVal -> SynthVal -> SynthVal -> SynthVal -> Node e SynthVal
+adsr tA tD tS tR v0 v1 v2 = adsr' $ ADSR tA tD tS tR v0 v1 v2
+{-# INLINABLE adsr #-}
 
 -- | @NaN@ literal
 nan :: SynthVal
@@ -604,12 +640,12 @@ nan = 0 / 0
 isNaN :: SynthVal -> Bool
 isNaN a = a /= a
 
--- | A node-parameterized version of `adsrEnvelope` which can take `ADSRParams` emitted from
--- a node. Note that this works fairly differently from `adsrEnvelope`: ADSR parameters here
+-- | A node-parameterized version of `adsr'` which can take `ADSRParams` emitted from
+-- a node. Note that this works fairly differently from `adsr'`: ADSR parameters here
 -- are variable so we have to keep the envelope state, incrementing it with a slope computed
 -- using the latest received ADSR parameters.
-adsrEnvelopeN :: Node e ADSRParams -> Node e SynthVal
-adsrEnvelopeN = mkNode1 (MkS2 nan Nothing) $
+adsr'N :: Node e ADSRParams -> Node e SynthVal
+adsr'N = mkNode1 (MkS2 nan Nothing) $
   \(!t, !d, _) (ADSR tA tD tS tR v0 v1 v2) (MkS2 x' precalcs') -> let
     -- using NaN as a (Nothing :: Maybe Double) to not have to waste resources on Just unbox
     -- but this won't generalize to all choices of SynthVal...  but realistically it's fine?
@@ -639,36 +675,89 @@ adsrEnvelopeN = mkNode1 (MkS2 nan Nothing) $
 twopi :: SynthVal
 twopi = 2 * pi
 
--- | Shared signal function for sin oscillators, with a phase/angle accumulator as state and
--- a phase input for phase modulation synthesis.
--- Sine oscillator based on https://juce.com/tutorials/tutorial_sine_synth/
-_sinOsc_fn :: TimeVal -> Ampl -> Freq -> SynthVal -> SynthVal -> SPair SynthVal SynthVal
-_sinOsc_fn d a f phase myAngleState = let
-  angleDelta = f * d
-  newAngleState' = myAngleState + angleDelta
-  newAngleState = if newAngleState' > 1 then newAngleState' - 1 else newAngleState'
-  -- tblSinIdx = round (_tblszf * (newAngleState + phase * invtwopi)) `mod` _tblsz
-  -- in (a * (_tblSin VU.! tblSinIdx), newAngleState)
-  -- using a sin wavetable doesn't actually save that much?
-  in MkS2 (a * sin (twopi * newAngleState + phase)) newAngleState
+-- | generic oscillator function with \"phase\" accumulator (but \"phase\" is from 0 to 1)
+_osc_fn :: TimeVal -> Freq -> Percent -> (Percent -> SynthVal) -> SPair SynthVal Percent
+_osc_fn d f myProgress k = let
+  progressDelta = f * d
+  newProgress' = myProgress + progressDelta
+  newProgress = if newProgress' > 1 then newProgress' - 1 else newProgress'
+  in MkS2 (k newProgress) newProgress
+  -- progress is from 0 to 1 (assuming f is never negative to not have to check <0...)
+{-# INLINE _osc_fn #-}
 
-_sinOsc_s0 :: SynthVal
-_sinOsc_s0 = 0.0
-{-# INLINE _sinOsc_s0 #-}
+_osc_s0 :: Percent
+_osc_s0 = 0.0
+{-# INLINE _osc_s0 #-}
 
-_sinOsc_SF :: SigEnv e -> Ampl -> Freq -> SynthVal -> SPair SynthVal SynthVal
+---------- sin oscillator with adjustable phase addition
+_sinOsc_fn :: TimeVal -> Ampl -> Freq -> Phase -> Percent -> SPair SynthVal Percent
+_sinOsc_fn d a f phase s = _osc_fn d f s $ \x -> a * sin (twopi * x + phase)
+
+_sinOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
 _sinOsc_SF (_, !d, _) a f = _sinOsc_fn d a f 0
 
-_sinOscP_SF :: SigEnv e -> Ampl -> Freq -> SynthVal -> SynthVal -> SPair SynthVal SynthVal
-_sinOscP_SF (_, !d, _) a f phase = _sinOsc_fn d a f phase
+_sinOscPM_SF :: SigEnv e -> Ampl -> Freq -> Phase -> Percent -> SPair SynthVal Percent
+_sinOscPM_SF (_, !d, _) a f phase = _sinOsc_fn d a f phase
 
--- | Sine oscillator, holding state for the current angle.
+-- | Sine oscillator taking amplitude and frequency as input nodes.
 sinOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
-sinOsc = MkNode2 _sinOsc_s0 _sinOsc_SF
+sinOsc = MkNode2 _osc_s0 _sinOsc_SF
 
--- | `sinOsc` but accepts phase as an input node (added to the angle of each sin compute).
-sinOscP :: Node e Ampl -> Node e Freq -> Node e SynthVal  -> Node e SynthVal
-sinOscP = mkNode3 _sinOsc_s0 _sinOscP_SF
+-- | `sinOsc` with phase modulation as a third input node.
+sinOscPM :: Node e Ampl -> Node e Freq -> Node e Phase -> Node e SynthVal
+sinOscPM = mkNode3 _osc_s0 _sinOscPM_SF
+
+---------- square oscillator with adjustable duty cycle
+_sqrOsc_fn :: TimeVal -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
+_sqrOsc_fn d a f duty s = _osc_fn d f s $ \x -> if x <= duty then (-a) else a
+
+_sqrOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
+_sqrOsc_SF (_, !d, _) a f = _sqrOsc_fn d a f 0.5
+
+_sqrOscDM_SF :: SigEnv e -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
+_sqrOscDM_SF (_, !d, _) a f duty = _sqrOsc_fn d a f duty
+
+-- | Square oscillator taking amplitude and frequency as input nodes.
+sqrOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
+sqrOsc = MkNode2 _osc_s0 _sqrOsc_SF
+
+-- | `sqrOsc` with duty cycle as a third input node.
+sqrOscDM :: Node e Ampl -> Node e Freq -> Node e Percent -> Node e SynthVal
+sqrOscDM = mkNode3 _osc_s0 _sqrOscDM_SF
+
+---------- saw oscillator with adjustable skew (0.5 = triangle, 0.0 or 1.0 = saw)
+_saw_fn :: Ampl -> Percent -> Percent -> SynthVal
+_saw_fn a skew x = let y = if x < skew then (x / skew) else (1 - x) / (1 - skew)
+  in a * (2 * y - 1)
+
+_sawOsc_fn :: TimeVal -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
+_sawOsc_fn d a f skew s = _osc_fn d f s $ _saw_fn a skew
+
+_sawOscSM_SF :: SigEnv e -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
+_sawOscSM_SF (_, !d, _) a f = _sawOsc_fn d a f
+
+_sawOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
+_sawOsc_SF (_, !d, _) a f = _sawOsc_fn d a f 1.0
+
+_triOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
+_triOsc_SF (_, !d, _) a f = _sawOsc_fn d a f 0.5
+
+-- | Saw oscillator taking amplitude and frequency as input nodes.
+sawOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
+sawOsc = MkNode2 _osc_s0 _sawOsc_SF
+
+-- | Triangle oscillator taking amplitude and frequency as input nodes.
+triOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
+triOsc = MkNode2 _osc_s0 _triOsc_SF
+
+-- | `sawOsc` with skew as a third input node. (0 and 1 = saw, 0.5 = triangle)
+sawOscSM :: Node e Ampl -> Node e Freq -> Node e Percent -> Node e SynthVal
+sawOscSM = mkNode3 _osc_s0 _sawOscSM_SF
+
+-- | `triOsc` with \"phase modulation\", almost like a \"coarser\", tri-shaped `sinOscPM`.
+triOscPM :: Node e Ampl -> Node e Freq -> Node e Phase -> Node e SynthVal
+triOscPM = let r2pi = recip twopi in mkNode3 _osc_s0 $ \(_, !d, _) a f phase s ->
+  _osc_fn d f s $ \x -> _saw_fn a 0.5 (x + phase * r2pi)
 
 --------------------------------------------------------------------------------
 -- ** Effects
@@ -717,15 +806,15 @@ _cookbookFilterN_s0 = MkS3 nan _cookbookFilter_nanCoeffs _cookbookFilter_zeroSta
 
 _cookbookFilter_SF :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> SigEnv e -> LR SynthVal -> SPair CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (SPair CookbookFilterCoeffs CookbookFilterState)
 _cookbookFilter_SF coeffsFn q f (_, d, _) x (MkS2 savedCoeffs savedState) = let
-  c = if isNaN savedCoeffs._a0inv then coeffsFn d q f else savedCoeffs
+  c = if isNaN savedCoeffs.a0inv then coeffsFn d q f else savedCoeffs
   s = _cookbookFilter_fn c savedState x
-  in MkS2 s._ym0 (MkS2 c s)
+  in MkS2 s.ym0 (MkS2 c s)
 
 _cookbookFilterN_SF :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> SigEnv e -> Freq -> LR SynthVal -> STriple Freq CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (STriple Freq CookbookFilterCoeffs CookbookFilterState)
 _cookbookFilterN_SF coeffsFn q (_, d, _) thisFreq x (MkS3 lastFreq savedCoeffs savedState) = let
   c = if thisFreq == lastFreq then savedCoeffs else coeffsFn d q thisFreq
   s = _cookbookFilter_fn c savedState x
-  in MkS2 s._ym0 (MkS3 thisFreq c s)
+  in MkS2 s.ym0 (MkS3 thisFreq c s)
 
 cookbookCoeffsFn_LPF :: TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs
 cookbookCoeffsFn_LPF d q f = let
@@ -735,15 +824,15 @@ cookbookCoeffsFn_LPF d q f = let
   alpha = sinom / (2 * q)
   b0 = (1 - cosom) / 2
   in MkCFCoeffs
-    { _a0inv = recip (1 + alpha)
-    , _a1 = -2 * cosom
-    , _a2 = 1 - alpha
-    , _b0 = b0
-    , _b1 = 1 - cosom
-    , _b2 = b0
+    { a0inv = recip (1 + alpha)
+    , a1 = -2 * cosom
+    , a2 = 1 - alpha
+    , b0 = b0
+    , b1 = 1 - cosom
+    , b2 = b0
     }
 
--- | RBJ 2nd-order filter. https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
+-- | RBJ 2nd-order filter. <https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html>
 -- Takes a coefficients-calculating function (which itself takes delta time, Q, frequency.)
 cookbookFilter :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
 cookbookFilter coeffsFn q f = mkNode1 _cookbookFilter_s0 (_cookbookFilter_SF coeffsFn q f)
@@ -769,29 +858,31 @@ lpfN = cookbookFilterN cookbookCoeffsFn_LPF
 echo' :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
 echo' delayMs decayMult wetLvl filterQ filterF wetPan = let delaySec = delayMs * 0.001; dryLvl = max 0 (1 - wetLvl)
   in flip (MkNode2IO (MkS2 DelayQueue.dummy _cookbookFilter_s0)) (pure ()) $ \r@(_, d, _) _ x (MkS2 savedDQ filterState) -> do
-    dq <- DelayQueue.unDummy (round $ delaySec / d) 0 savedDQ
-    delayOut <- DelayQueue.pop 0 dq
+    dq <- DelayQueue.unDummy (round $ delaySec / d) zeroLR savedDQ
+    delayOut <- DelayQueue.pop zeroLR dq
     let delayIn = x + (decayMult .*: delayOut)
     DelayQueue.push delayIn dq
     let (MkS2 filteredDelayOut filterState') = _cookbookFilter_SF cookbookCoeffsFn_LPF filterQ filterF r delayOut filterState
-    pure $ MkS2 ((dryLvl .*: x) + repanLR wetPan (wetLvl .*: filteredDelayOut)) (MkS2 dq filterState')
+    pure $ MkS2 ((dryLvl .*: x) + balanceLR wetPan (wetLvl .*: filteredDelayOut)) (MkS2 dq filterState')
 
 -- | Single-stream echo with constant delay time and decay multiplier. This produces the raw
 -- echo wet signal; do your own mixing and filtering afterwards (or use `echo`.)
 echoRaw :: TimeVal -> Ampl -> Node e (LR SynthVal) -> Node e (LR SynthVal)
 echoRaw delayMs decayMult = let delaySec = delayMs * 0.001
   in flip (MkNode2IO DelayQueue.dummy) (pure ()) $ \(_, d, _) _ x savedDQ -> do
-    dq <- DelayQueue.unDummy (round $ delaySec / d) 0 savedDQ
-    delayOut <- DelayQueue.pop 0 dq
+    dq <- DelayQueue.unDummy (round $ delaySec / d) zeroLR savedDQ
+    delayOut <- DelayQueue.pop zeroLR dq
     let delayIn = x + (decayMult .*: delayOut)
     DelayQueue.push delayIn dq
     pure $ MkS2 delayOut dq
 
 -- | Single-stream echo with constant delay time, decay multiplier, wet mix level (0-1), low
 -- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
+--
+-- Less efficient but more readable and extensible implementation of `echo'`.
 echo :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
 echo delayMs decayMult wetLvl filterQ filterF wetPan input = output
   where
     input' = share input
     filteredDelayOut = lpf filterQ filterF $ echoRaw delayMs decayMult input'
-    output = (1 - wetLvl) *|| input' + (repan wetPan $ wetLvl *|| filteredDelayOut)
+    output = (1 - wetLvl) *|| input' + (balance wetPan $ wetLvl *|| filteredDelayOut)

@@ -34,13 +34,12 @@ data HailstoneAudioHandle e = forall format. (PA.StreamFormat format) => MkHAH
 
 -- | callback that PortAudio will fire to fill a buffer of samples to play
 paAudioCallback :: ChanMode -- ^ stereo or mono
-                -> Common.SampleChOut -- ^the output end of the sample chan/queue, to consume
-                -> Common.SampleChCountTVar -- ^queued count
+                -> Common.SampleQueue
                 -> PA.StreamCallback SampleVal SampleVal
-paAudioCallback cm sampChO queuedCountTV _ _ nSamplesPerBuffer _ outPtr = let
+paAudioCallback cm sampQ _ _ nSamplesPerBuffer _ outPtr = let
   realBufLen = (fromIntegral nSamplesPerBuffer) * (case cm of Stereo -> 2; _ -> 1)
   writer = Foreign.Storable.pokeElemOff outPtr
-  in Common.consumerLoop realBufLen cm sampChO queuedCountTV PA.Continue writer
+  in Common.consumerLoop realBufLen cm sampQ PA.Continue writer
 
 -- | Run PortAudio given a sample rate, buffer size, channel mode, extra signal environment,
 -- initial node graph, and an IO action, and then terminate.
@@ -56,7 +55,7 @@ withAudio sampleRate nSamplesPerBuffer chanMode initEnv initNode action = (*> pu
       sink = fresh { _destNode = initNode }
 
   -- start the producer thread
-  (sampChO, queuedCountTV, replacementSinkMV, producerThreadId) <-
+  (sampQ, replacementSinkMV, producerThreadId) <-
     Common.startProducer nSamplesPerBuffer chanMode sink
 
   -- maybe this helps to reduce initial stutters by preemptively GC'ing
@@ -65,7 +64,7 @@ withAudio sampleRate nSamplesPerBuffer chanMode initEnv initNode action = (*> pu
   PA.withDefaultStream 0 (case chanMode of Stereo -> 2; _ -> 1)
     (fromIntegral sampleRate)
     (Just $ fromIntegral nSamplesPerBuffer)
-    (Just $ paAudioCallback chanMode sampChO queuedCountTV)
+    (Just $ paAudioCallback chanMode sampQ)
     (Just $ pure ()) $ \stream -> do
       action $ MkHAH
         { _HAHpaStream = stream

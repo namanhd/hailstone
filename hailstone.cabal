@@ -1,3 +1,4 @@
+cabal-version:        3.0
 name:                 hailstone
 version:              0.1.0.0
 synopsis:             audio synthesis + music composition
@@ -8,7 +9,6 @@ author:               namanh
 copyright:            2025 namanh
 category:             Sound
 build-type:           Simple
-cabal-version:        >=1.10
 
 flag audio-backend-sdl
   description:        The default audio backend is PortAudio (smaller dependency footprint).
@@ -19,11 +19,12 @@ flag audio-backend-sdl
 
 library
   hs-source-dirs:     src
-  ghc-options:        -Wall -O3 -threaded
+  ghc-options:        -Wall -O2 -threaded
   default-language:   Haskell2010
   exposed-modules:    Sound.Hailstone.Synth
                     , Sound.Hailstone.Types
-  other-modules:      Sound.Hailstone.VoiceAlloc
+                    , Sound.Hailstone.VoiceAlloc
+                    , Sound.Hailstone.Types.LR
                     , Sound.Hailstone.DelayQueue
   build-depends:      base >= 4.7 && < 5
                     , array
@@ -32,11 +33,11 @@ executable hailstone-scratch
   hs-source-dirs:     exe
   main-is:            ScratchMain.hs
   other-modules:      Sound.Hailstone.Backends.Common
-  ghc-options:        -Wall -O3 -threaded -rtsopts -with-rtsopts "-N -maxN2 -H20m"
+  ghc-options:        -Wall -O2 -threaded -rtsopts -with-rtsopts "-N -maxN2 -H20m"
   default-language:   Haskell2010
   build-depends:      base >= 4.7 && < 5
                     , hailstone
-                    , unagi-chan
+                    , array
 
   if flag(audio-backend-sdl)
     cpp-options:      -DHLSTN_AUDIO_BACKEND_SDL

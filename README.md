@@ -174,7 +174,7 @@ echo delayMs decayMult wetLvl filterQ filterF wetPan input = output
 Of course, `share` is meant for the higher-level EDSL user-facing interface of composing nodes together.
 If one is up for the task of writing new nodes/node functions (such as the library implementer, or an enterprising EDSL user), the better way is to directly write a new node function with this logic in the signal function itself.
 
-For instance, one could define a bespoke "fused" node implementing the `echo` example. Its signal function might use the same value from an argument node for multiple math operations Inside the signal function is normal pure Haskell code operating on real values, so normal, expected sharing semantics apply. Check out `echo'` in `Sound.Hailstone.Synth` to see this implementation.
+For instance, one could define a bespoke "fused" node implementing the `echo` example. Its signal function might use the same value from an argument node for multiple math operations. Inside the signal function is normal pure Haskell code operating on real values, so normal, expected sharing semantics apply. Check out `echo'` in `Sound.Hailstone.Synth` to see this implementation.
 
 
 ## Composition
@@ -192,12 +192,13 @@ buffer in time for when it's needed for playback.
 
 *Generating samples only within the audio callback is way too brittle and prone to GC stops.* This causes underruns and crackling even at very high buffer sizes.
 
-Instead, we run a separate "producer" thread that writes samples to a concurrent channel/queue/ringbuffer (using [unagi-chan](https://hackage.haskell.org/package/unagi-chan)'s unboxed channel implementation for fewer allocations, with a queue size bound we impose manually). Then, a backend audio callback's only job is to be the "consumer" of that queue, copying samples over to a buffer to be played.
+Instead, we run a separate "producer" thread that writes samples to a concurrent channel/queue/ringbuffer. 
+Then, a backend audio callback's only job is to be the "consumer" of that queue, copying samples over to a buffer to be played.
 
 This is a cushion that lets our sample-generating node graph be free to run ahead of the backend-fired audio callback, so that any lag or GC hiccup during sample generation has minimal effect on audio consistency. *As long as the producer thread maintains a consistent lead over the audio callback*, there won't be any underruns due to instantaneous producer-side hiccups.
 
 In practice, there may still be tiny hiccups, especially during the first instantaneous moments of playback.
-A tiny delay before enabling the callbacks may help; some RTS options-tweaking also appears effective, particularly parallel GC
+Padding a tiny bit of silence before the actual audio may help; some RTS options-tweaking also appears effective, particularly parallel GC
 with the `-N` option (which makes available all CPU threads up to `-maxN` threads; though just 2 seems good and memory-efficient.)
 
 These settings are in the `hailstone.cabal` file as the default rtsopts to compile with:
@@ -208,35 +209,36 @@ These settings are in the `hailstone.cabal` file as the default rtsopts to compi
 
 (the size of `-A` and `-H` can also be adjusted depending on the program; some experimentation needed. Keep `-s` to view the stats, omit it otherwise.)
 
+#### SIMD math
+Effects processing is basically specialized for stereo pairs of `Double`s, which allows for some further hand-rolled optimizations.
+
+Specifically, I've defined specialized unboxed SIMD representations of the stereo pair type. (This really has less to do with speeding up arithmetic and more to do with reducing boxing as much as possible, since the GC is the enemy of real-time audio here.) The code for this is in `Sound.Hailstone.Types.LR`; this has only very recently been feasible with the native code generator starting from GHC 9.12.x.
+
 ### Offline/other backends
 
 There will be simple wav-exporting backends implemented at some point, probably when I start experimenting with audio graphs much larger than what can be handled live/near-real-time.
 
-## Issues and drawbacks
+### Issues
 
 It is really hard to get predictable, fast performance for live audio applications in pure Haskell. Most everyone has given up on getting end-to-end Haskell audio to be real-time capable; even the [venerable co-author of Euterpea and the  Haskell School of Music](https://www.donyaquick.com/vivid-as-a-real-time-audio-solution-for-euterpea/) has sworn off attempting real-time in pure Haskell.
 
-That said, I still think this is really interesting to work through for learning both Haskell and DSP.
-With some effort in adding strictness annotations, reducing boxing and representing state using simpler types, we can reduce space leaks and relieve GC lag.
-
-The `Node` representation is a big step up from my previous attempts (4 years ago... ouch.) Before this I'd hopped around representations, first lazy infinite lists, which had free memoization by the runtime but were extremely allocation-heavy, then the simple `t -> x` reader monad which did not have statefulness that could compose. It's cool to have landed on something that seems to address these issues, though there will be definitely many more problems.
-
-For any nontrivial audio processing, this will probably still need to be offline rather than real-time. That said, I'm doing my testing via PortAudio (previously SDL audio) to play audio live as the program runs.
+That said, with some effort in adding strictness annotations, specializing, reducing boxing and representing state using simpler types, we can reduce space leaks and relieve GC lag.
 
 ## Organization
-The library is in `src/`, and has no dependencies other than `base` and `array` at the moment. You can load the `Sound.Hailstone.Synth` module in GHCi or another Main to try it out directly, no `stack` or package installations needed.
+The library is in `src/`, and has no dependencies other than `base` and `array` at the moment. You can load the `Sound.Hailstone.Synth` module in GHCi or another Main to try it out directly, no external package installations needed.
 
-The executable is in `exe/ScratchMain.hs`, which is
-where we write test songs and synths to play around with. It depends on `portaudio` and `unagi-chan`, and should probably be built using the `stack` instructions below.
+The executable is in `exe/ScratchMain.hs`, which is where we write test songs and synths to
+play around with. It depends on `portaudio` and `array` and should be built as a project,
+using the .cabal file.
 
 ## Building
 ```
-stack build
-stack run
+cabal build
+cabal run
 ```
-Requires `portaudio` to be installed on the system. (also, the included `stack.yaml`
-uses the system ghc by default, which you might want to change depending on the
-config)
+Requires `portaudio` to be installed on the system.
 
-Current `stack` resolver is `lts-24.10` (ghc 9.10.2).
-However, this should work with newer ghcs and resolvers just fine.
+**Requires GHC >=9.12.2** (for SIMD math with the native code generator. Older GHCs may work
+with `-fllvm`, but I haven't tested this with the LLVM codegen.)
+
+This should probably work with newer ghcs fine.

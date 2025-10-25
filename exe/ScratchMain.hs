@@ -4,7 +4,6 @@
 
 module Main where
 
-import Data.Functor ((<&>))
 import Sound.Hailstone.Synth
 
 -- the backends are interchangeable
@@ -69,43 +68,50 @@ testSong2 = let
 testSynth0 :: Node e LiveCell -> Node e (LR SynthVal)
 testSynth0 lc = finalNode
   where
-    f = lc <&> (.freq)
-    a = lc <&> (.ampl)
-    e = lc <&> (.env) -- note envelope current value
-    -- pan = lc <&> (.pan)
-    finalNode = m2s $ e * sinOsc a (f * (1 +| sinOsc (linearRamp 1.2 5 12) 0.02))
+    f = lc.freq
+    a = lc.ampl
+    e = lc.env -- note envelope current value
+    -- pan = lc.pan
+    finalNode = mono2stereo $ e * sinOsc a (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
 
 testSynth1 :: Node e LiveCell -> Node e (LR SynthVal)
 testSynth1 lc = finalNode
   where
-    f = share $ lc <&> (.freq)
-    a = lc <&> (.ampl)
-    e = share $ lc <&> (.env) -- note envelope current value
+    f = share $ lc.freq
+    a = lc.ampl
+    e = share $ lc.env -- note envelope current value
     -- pan = lc <&> (.pan)
-    sinModulator3 = adsrEnvelope (ADSR 0.02 0.0 0.02 0.01 0.0 1.0 1.0) * sinOsc e (5 *| f)
+    sinModulator3 = adsr 0.02 0.0 0.02 0.01 0.0 1.0 1.0 * sinOsc e (5 *| f)
     fWithVibrato = (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
-    sinCarrier = sinOscP a fWithVibrato sinModulator3
-    finalNode = m2s $ e * sinCarrier
+    sinCarrier = sinOscPM a fWithVibrato sinModulator3
+    finalNode = mono2stereo $ e * sinCarrier
 
 testSynth2 :: Node e LiveCell -> Node e (LR SynthVal)
 testSynth2 lc = finalNode
   where
-    f = share $ lc <&> (.freq)
-    a = share $ lc <&> (.ampl)
-    e = share $ lc <&> (.env) -- note envelope current value
+    f = share $ lc.freq
+    a = share $ lc.ampl
+    e = share $ lc.env -- note envelope current value
     -- also apply a pitch envelope on top of vibrato
-    fWithVibrato = share $ nADSR 0.01 0.0 0.05 0.01 0.0 1.0 1.0 * (f * (1 +| sinOsc 0.02 5))
-    sinModulator1 = e * nADSR  0.04 0.0 0.05 0.01 0.1 1.0 1.0 * sinOsc 0.7 (5 *| f)
-    sinCarrier1 = sinOscP a fWithVibrato sinModulator1
-    sinModulator2 = nADSR 0.0 0.0 0.0 0.07 1.0 1.0 0.0 * sinOsc 1.2 (6 *| f)
-    sinCarrier2 = sinOscP a (2 *| fWithVibrato) sinModulator2
-    finalNode = m2s $ e * (sinCarrier1 + sinCarrier2)
+    fWithVibrato  = share $ adsr 0.01 0.0 0.05 0.01 0.0 1.0 1.0 * (f * (1 +| sinOsc 0.02 5))
+    sinModulator1 = e * adsr 0.04 0.0 0.05 0.01 0.1 1.0 1.0 * sinOsc 0.7 (5 *| f)
+    sinCarrier1   = sinOscPM a fWithVibrato sinModulator1
+    sinModulator2 = adsr 0.0 0.0 0.0 0.07 1.0 1.0 0.0 * sinOsc 1.2 (5 *| f)
+    sinCarrier2   = sinOscPM a (2 *| fWithVibrato) sinModulator2
+    finalNode     = mono2stereo $ e * (sinCarrier1 + sinCarrier2)
 
+testSynth3 :: Node e LiveCell -> Node e (LR SynthVal)
+testSynth3 lc = finalNode
+  where
+    f = lc.freq
+    a = lc.ampl
+    e = lc.env
+    finalNode = lpf 1.0 6200 $ mono2stereo $ e * triOscPM a f (sqrOscDM 0.7 (7 *| f) (linearRamp 0.02 1 0))
 
 tonetestmain :: IO ()
 tonetestmain = do
   let sampleRate = 44100
-      bufferSize = 128
+      bufferSize = 64
       chanMode = Stereo
 
   putStrLn "Making song sample stream"
@@ -115,7 +121,7 @@ tonetestmain = do
       EnvelopeIgnoresCellDuration RetrigPolyphonic 0.0 0.0 synth notes
     mixed = playNotes testSynth2 testSong2
     master = echo' 96 0.5 0.4 1.0 800 0.2 mixed
-    destNode = startAt 0 0.1 10 $ asPCM master
+    destNode = asPCM $ startAt 0 0.1 10 $ master
 
   putStrLn "Opening audio"
   withAudio sampleRate bufferSize chanMode () destNode $ \hah -> do

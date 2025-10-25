@@ -36,17 +36,16 @@ data HailstoneAudioHandle e = MkHAH
 
 -- | callback that SDL will fire to fill a buffer of samples to play
 sdlAudioCallback  :: ChanMode -- ^ stereo or mono
-                  -> Common.SampleChOut -- ^the output end of the sample chan/queue, to consume
-                  -> Common.SampleChCountTVar -- ^queued count
+                  -> Common.SampleQueue
                   -> SDL.AudioFormat s -- ^SDL Audio Format identifier
                   -> SMV.IOVector s -- ^SDL-side vector to write samples to
                   -> IO ()
-sdlAudioCallback cm sampChO queuedCountTV sdlAudioFormat sdlAudioBuffer = case sdlAudioFormat of
+sdlAudioCallback cm sampQ sdlAudioFormat sdlAudioBuffer = case sdlAudioFormat of
   -- need to match on this because it's a GADT constructor that instantiates a sample type s
   SDL.Signed16BitLEAudio -> let
     realBufLen = SMV.length sdlAudioBuffer
     writer = SMV.write sdlAudioBuffer
-    in Common.consumerLoop realBufLen cm sampChO queuedCountTV () writer
+    in Common.consumerLoop realBufLen cm sampQ () writer
   _ -> putStrLn "Unsupported audio sample format"
 
 -- | Initialize SDL (the Audio subsystem only) given a sample rate, buffer size, and initial
@@ -62,7 +61,7 @@ openAudio sampleRate nSamplesPerBuffer chanMode initEnv initNode = do
       sink = fresh { _destNode = initNode }
 
   -- start the producer thread
-  (sampChO, queuedCountTV, replacementSinkMV, producerThreadId) <-
+  (sampQ, replacementSinkMV, producerThreadId) <-
     Common.startProducer nSamplesPerBuffer chanMode sink
 
   -- function "requests" an audio spec from the hardware, using the requests/demands we
@@ -74,7 +73,7 @@ openAudio sampleRate nSamplesPerBuffer chanMode initEnv initNode = do
     , SDL.openDeviceFormat = SDL.Mandate sampleType
     , SDL.openDeviceChannels = SDL.Mandate stereoMode
     , SDL.openDeviceSamples = nSamplesPerBuffer
-    , SDL.openDeviceCallback = sdlAudioCallback chanMode sampChO queuedCountTV
+    , SDL.openDeviceCallback = sdlAudioCallback chanMode sampQ
     , SDL.openDeviceUsage = SDL.ForPlayback
     , SDL.openDeviceName = Nothing -- any output audio device will do
     }

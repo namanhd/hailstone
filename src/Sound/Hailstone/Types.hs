@@ -1,19 +1,21 @@
 {-# LANGUAGE Strict #-}
+{-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE NoFieldSelectors #-}
+{-# LANGUAGE BangPatterns #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
-{-# LANGUAGE OverloadedRecordDot, DuplicateRecordFields, BangPatterns, ScopedTypeVariables #-}
 
 module Sound.Hailstone.Types
 ( -- * Type synonyms and datatypes
   -- ** Canonical math value type
   SynthVal
   -- ** Synonyms for `SynthVal` for its different uses
-, Freq, Ampl, Gain, Pan, TimeVal
+, Freq, Ampl, Gain, Pan, Phase, Percent, TimeVal
   -- ** Strict tuples
 , SPair(..)
 , STriple(..)
   -- *** Strict stereo pair
-, LR(..)
-, dupLR, (.+:), (.*:), repanLR
+, module Sound.Hailstone.Types.LR
   -- ** Integer types
 , SampleRate, SampleVal
   -- ** Note data & config
@@ -28,7 +30,7 @@ module Sound.Hailstone.Types
 ) where
 
 import Data.Int (Int16)
-import Foreign (Storable, castPtr, peek, poke, pokeElemOff, peekElemOff, sizeOf, alignment)
+import Sound.Hailstone.Types.LR
 
 -- | Shared number type for all calculations in synthesis functions.
 type SynthVal = Double
@@ -49,6 +51,12 @@ type Gain = SynthVal
 -- | Panning percentage as percentage Right; i.e. 0.0 is hard left, 0.5 is
 -- centered, and 1.0 is hard right.
 type Pan = SynthVal
+
+-- | Generic percentage value, 0.0 to 1.0
+type Percent = SynthVal
+
+-- | Angle or phase in radians
+type Phase = SynthVal
 
 -- | Channel mode.
 data ChanMode = Mono | Stereo
@@ -101,19 +109,19 @@ data LiveCell = MkLC
 -- | Attack-decay-sustain-release envelope parameters. Values of type `SynthVal`
 -- used here, which are "levels" or "gains", are between 0 and 1 inclusive.
 data ADSRParams = ADSR
-  { _tA :: !TimeVal
+  { tA :: !TimeVal
     -- ^Time taken to go from the starting level to 1.0
-  , _tD :: !TimeVal
+  , tD :: !TimeVal
     -- ^Time taken to decay from 1.0 to the sustain level
-  , _tS :: !TimeVal
+  , tS :: !TimeVal
     -- ^Sustain time
-  , _tR :: !TimeVal
+  , tR :: !TimeVal
     -- ^Time taken to release from sustain level to end level
-  , _v0 :: !SynthVal
+  , v0 :: !SynthVal
     -- ^The starting level for the envelope
-  , _v1 :: !SynthVal
+  , v1 :: !SynthVal
     -- ^Sustain level
-  , _v2 :: !SynthVal
+  , v2 :: !SynthVal
     -- ^End level
   } deriving (Show, Eq)
 
@@ -130,108 +138,22 @@ data SPair a b = MkS2 !a !b
 data STriple a b c = MkS3 !a !b !c
   deriving (Eq, Show)
 
--- | Convenience tuple of two audio values, one for each channel (left and right).
-data LR a = MkLR !a !a
-  deriving (Eq, Show)
-
-instance Functor LR where
-  fmap f (MkLR al ar) = MkLR (f al) (f ar)
-
-instance Applicative LR where
-  pure = dupLR
-  {-# INLINE pure #-}
-  (MkLR fl fr) <*> (MkLR al ar) = MkLR (fl al) (fr ar)
-  {-# INLINABLE (<*>) #-}
-  liftA2 f (MkLR al ar) (MkLR bl br) = MkLR (f al bl) (f ar br)
-  {-# INLINABLE liftA2 #-}
-
-instance Foldable LR where
-  foldr f b (MkLR al ar) = f ar (f al b)
-  {-# INLINE foldr #-}
-
-instance Traversable LR where
-  sequenceA (MkLR al ar) = liftA2 MkLR al ar
-  {-# INLINE sequenceA #-}
-
-instance Storable a => Storable (LR a) where
-  sizeOf = const $ 2 * sizeOf (undefined :: a)
-  alignment = const $ alignment (undefined :: a)
-  peek ptr = do
-    q <- pure $ castPtr ptr
-    al <- peek q
-    ar <- peekElemOff q 1
-    pure (MkLR al ar)
-  poke ptr (MkLR al ar)  = do
-    q <- pure $ castPtr ptr
-    poke q al
-    pokeElemOff q 1 ar
-
--- | Trivially make a mono value into a stereo value.
-dupLR :: a -> LR a
-dupLR a = MkLR a a
-{-# INLINABLE dupLR #-}
-
--- | Add a scalar to an `LR`.
-(.+:) :: Num a => a -> LR a -> LR a
-a .+: (MkLR l r) = (MkLR (a + l) (a + r))
-
--- | Scale an `LR` by a scalar.
-(.*:) :: Num a => a -> LR a -> LR a
-a .*: (MkLR l r) = (MkLR (a * l) (a * r))
-
--- | Pans an `LR` by a pan value (hard right is 1.0, hard left is 0.0)
-repanLR :: Num a => a -> LR a -> LR a
-{-# SPECIALIZE repanLR :: Pan -> LR SynthVal -> LR SynthVal #-}
-repanLR p (MkLR !al !ar) = let a = al + ar in MkLR ((1 - p) * a) (p * a)
-
-instance (Num a) => Num (LR a) where
-  (+) = liftA2 (+)
-  (*) = liftA2 (*)
-  (-) = liftA2 (-)
-  abs = fmap abs
-  negate = fmap negate
-  signum = fmap signum
-  fromInteger = pure . fromInteger
-
-instance (Fractional a) => Fractional (LR a) where
-  (/) = liftA2 (/)
-  recip = fmap recip
-  fromRational = pure . fromRational
-
-instance (Floating a) => Floating (LR a) where
-  pi = pure pi
-  exp = fmap exp
-  log = fmap log
-  sin = fmap sin
-  cos = fmap cos
-  sqrt = fmap sqrt
-  asin = fmap asin
-  acos = fmap acos
-  atan = fmap atan
-  sinh = fmap sinh
-  cosh = fmap cosh
-  asinh = fmap asinh
-  acosh = fmap acosh
-  atanh = fmap atanh
-  (**) = liftA2 (**)
-  logBase = liftA2 logBase
-
--- | see https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
+-- | see <https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html>
 data CookbookFilterCoeffs = MkCFCoeffs
-  { _a0inv :: !SynthVal
-  , _a1 :: !SynthVal
-  , _a2 :: !SynthVal
-  , _b0 :: !SynthVal
-  , _b1 :: !SynthVal
-  , _b2 :: !SynthVal
+  { a0inv :: !SynthVal
+  , a1 :: !SynthVal
+  , a2 :: !SynthVal
+  , b0 :: !SynthVal
+  , b1 :: !SynthVal
+  , b2 :: !SynthVal
   } deriving (Show, Eq)
 
--- | see https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html
+-- | see <https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html>
 data CookbookFilterState = MkCFState
-  { _xm0 :: {-# NOUNPACK #-} !(LR SynthVal)
-  , _xm1 :: {-# NOUNPACK #-} !(LR SynthVal)
-  , _xm2 :: {-# NOUNPACK #-} !(LR SynthVal)
-  , _ym0 :: {-# NOUNPACK #-} !(LR SynthVal)
-  , _ym1 :: {-# NOUNPACK #-} !(LR SynthVal)
-  , _ym2 :: {-# NOUNPACK #-} !(LR SynthVal)
-  } deriving (Show, Eq)
+  { xm0 :: !(LR SynthVal)
+  , xm1 :: !(LR SynthVal)
+  , xm2 :: !(LR SynthVal)
+  , ym0 :: !(LR SynthVal)
+  , ym1 :: !(LR SynthVal)
+  , ym2 :: !(LR SynthVal)
+  }
