@@ -34,13 +34,15 @@ import GHC.Exts (Ptr(..))
 
 -- for an MArray instance
 import Data.Array.Base
-  ( MArray, STUArray(..)
+  ( MArray, STUArray(..), UArray(..), IArray
   , safe_scale, getBounds, newArray, newArray_, getNumElements
   , unsafeNewArray_, unsafeNewArraySTUArray_, unsafeRead, unsafeWrite
+  , bounds, numElements, unsafeArray, unsafeAt, unsafeReplace, unsafeAccum, unsafeAccumArray
+  , unsafeArrayUArray, unsafeAccumUArray, unsafeAccumArrayUArray, unsafeReplaceUArray
   )
 import Data.Array.IO.Internals (IOUArray(..))
 import GHC.ST (ST(..))
-import Control.Monad.ST (stToIO)
+import Control.Monad.ST (stToIO, runST)
 
 class LRx a where
   -- | A stereo pair of values of type @a@. Has special SIMD representations for certain @a@
@@ -297,12 +299,10 @@ instance MArray (STUArray s) (LR Double) (ST s) where
   newArray_ arrBounds = newArray arrBounds 0
   {-# INLINE unsafeRead #-}
   unsafeRead (STUArray _ _ _ marr#) (I.I# i#) = ST $ \s1# ->
-      case B.readDoubleX2Array# marr# i# s1# of { (# s2#, e# #) ->
-      (# s2#, MkDX2# e# #) }
+    case B.readDoubleX2Array# marr# i# s1# of (# s2#, e# #) -> (# s2#, MkDX2# e# #)
   {-# INLINE unsafeWrite #-}
   unsafeWrite (STUArray _ _ _ marr#) (I.I# i#) (MkDX2# e#) = ST $ \s1# ->
-      case B.writeDoubleX2Array# marr# i# e# s1# of { s2# ->
-      (# s2#, () #) }
+    case B.writeDoubleX2Array# marr# i# e# s1# of s2# -> (# s2#, () #)
 
 instance MArray IOUArray (LR Double) IO where
   {-# INLINE getBounds #-}
@@ -321,6 +321,23 @@ instance MArray IOUArray (LR Double) IO where
   unsafeRead (IOUArray marr) i = stToIO (unsafeRead marr i)
   {-# INLINE unsafeWrite #-}
   unsafeWrite (IOUArray marr) i e = stToIO (unsafeWrite marr i e)
+
+instance IArray UArray (LR Double) where
+  {-# INLINE bounds #-}
+  bounds (UArray l u _ _) = (l,u)
+  {-# INLINE numElements #-}
+  numElements (UArray _ _ n _) = n
+  {-# INLINE unsafeArray #-}
+  unsafeArray lu ies = runST (unsafeArrayUArray lu ies 0)
+  {-# INLINE unsafeAt #-}
+  unsafeAt (UArray _ _ _ arr#) (I.I# i#) = MkDX2# (B.indexDoubleX2Array# arr# i#)
+  {-# INLINE unsafeReplace #-}
+  unsafeReplace arr ies = runST (unsafeReplaceUArray arr ies)
+  {-# INLINE unsafeAccum #-}
+  unsafeAccum f arr ies = runST (unsafeAccumUArray f arr ies)
+  {-# INLINE unsafeAccumArray #-}
+  unsafeAccumArray f initialValue lu ies = runST (unsafeAccumArrayUArray f initialValue lu ies)
+
 
 instance Floating (LR Double) where
   pi = dupLR pi

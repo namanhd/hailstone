@@ -27,7 +27,7 @@ module Sound.Hailstone.Synth
   -- DSL see the sharing semantics, the let-bindings & usage of names, of the host language.
   Node(..)
   -- *** Convenient derived constructors
-, mkNode1, mkNode3
+, mkNode1, mkNode1IO, mkNode3, mkNode4_
   -- ** Observable sharing
 , share
   -- ** Consuming nodes at the audio backend
@@ -38,9 +38,6 @@ module Sound.Hailstone.Synth
 , asPCM, stereodup, monosum, mono2stereo, stereo2mono, mapLRNode, balance
   -- ** Sequencing
 , startAt, piecewiseMono, piecewisePoly, cascade
-  -- *** Retriggering with `Cell`s
-, EnvelopeCellDurationMode(..), RetriggerMode(..)
-, retriggerWith
   -- ** Envelopes
 , adsr', adsr'N, adsr
 , funcRamp, linearRamp
@@ -58,7 +55,6 @@ where
 
 import Prelude hiding (isNaN)
 import Data.Ord (clamp)
-import Data.List (sortOn)
 import Data.Functor ((<&>))
 import Sound.Hailstone.Types
 import qualified Sound.Hailstone.VoiceAlloc as VoiceAlloc
@@ -199,7 +195,7 @@ instance (Floating a) => Floating (Node e a) where
   (**) = liftA2 (**)
   logBase = liftA2 logBase
 
--- | So that @Node e LiveCell@ lifts record dot access for the inner `LiveCell` to `Node`.
+-- | Make record dot access reach inside a Node
 instance (HasField name r a) => HasField name (Node e r) (Node e a) where
   getField = fmap (getField @name)
 
@@ -211,14 +207,27 @@ mkNode1 :: s -> (SigEnv e -> a -> s -> SPair x s) -> Node e a -> Node e x
 mkNode1 s sig = MkNode2 s (\r _ a -> sig r a) (pure ())
 {-# INLINABLE mkNode1 #-}
 
+-- | Constructor for a unary IO-effectful node, derived from `MkNode2IO`.
+mkNode1IO :: s -> (SigEnv e -> a -> s -> IO (SPair x s)) -> Node e a -> Node e x
+mkNode1IO s sig = MkNode2IO s (\r _ a -> sig r a) (pure ())
+{-# INLINABLE mkNode1IO #-}
+
 -- | Constructor for a ternary node, derived from `MkNode2`. (This pattern of tupling up arg
 -- nodes can be extended indefinitely to higher arities if we ever need them.)
 mkNode3 :: s -> (SigEnv e -> a -> b -> c -> s -> SPair x s) -> Node e a -> Node e b -> Node e c -> Node e x
 mkNode3 s sig ~aNode ~bNode = MkNode2 s (\r (MkS2 a b) -> sig r a b) (liftA2 MkS2 aNode bNode)
 {-# INLINABLE mkNode3 #-}
 
+-- | Constructor for a stateless 4-ary node.
+mkNode4_ :: (SigEnv e -> a -> b -> c -> d -> x) -> Node e a -> Node e b -> Node e c -> Node e d -> Node e x
+mkNode4_ sig ~aNode ~bNode ~cNode ~dNode = MkNode2_ (\r (MkS2 a b) (MkS2 c d) -> sig r a b c d)
+  (liftA2 MkS2 aNode bNode) (liftA2 MkS2 cNode dNode)
+{-# INLINABLE mkNode4_ #-}
+
 --------------------------------------------------------------------------------
 -- ** Observable sharing
+
+data OshCache a = MkOshCached {-# UNPACK #-} !TimeVal !a | MkOshNothing
 
 -- | Uses `unsafePerformIO` to allow a node to cache its output, keyed by current time. If a
 -- cache-supporting node is run with a new @t@ /different/ from the @t@ of the current cache
@@ -248,19 +257,17 @@ mkNode3 s sig ~aNode ~bNode = MkNode2 s (\r (MkS2 a b) -> sig r a b) (liftA2 MkS
 -- of this approach (observable sharing had been described in papers prior.)
 share :: Node e x -> Node e x
 share me@(MkNodeConst _) = me
-share ~node = unsafePerformIO $ newIORef Nothing <&> \ref -> MkNode0IO Nothing $
-  \r@(!t, _, _) ~maybeMyNode -> let
-    ~runit = runNode r (maybe node id maybeMyNode) >>= \(MkS2 x new_node) ->
-      writeIORef ref (Just (MkS2 t x)) *> pure (MkS2 x (Just new_node))
+share ~node = unsafePerformIO $ newIORef MkOshNothing <&> \ref -> MkNode0IO Nothing $
+  \r@(!t, _, _) ~maybeMyNode -> readIORef ref >>= \case
     -- on cache miss, run (either the original node or our saved current version of it) then
     -- cache the result, then return it, and save (Just new_node) as our new saved state. If
     -- the cache hits, then the cache ALWAYS hits, because we come after the 1st instance of
     -- this shared node in the tree, our node state is always Nothing, runit never runs, and
     -- thereby guaranteeing that ONLY 1 copy of the shared node's tree is stored anywhere in
     -- the final tree.
-    in readIORef ref >>= \case
-      Just (MkS2 tc xc) -> if tc == t then pure (MkS2 xc maybeMyNode) else runit
-      Nothing -> runit
+    (MkOshCached tc xc) | tc == t -> pure (MkS2 xc maybeMyNode)
+    _ -> runNode r (maybe node id maybeMyNode) >>= \(MkS2 x new_node) ->
+      writeIORef ref (MkOshCached t x) *> pure (MkS2 x (Just new_node))
 {-# NOINLINE share #-}
 
 --------------------------------------------------------------------------------
@@ -408,7 +415,7 @@ modifyTime f df node = case node of
   (MkNode2IO s sig aNode bNode) -> MkNode2IO s (sfgo sig) (modifyTime f df aNode) (modifyTime f df bNode)
   where
     sfgo :: (SigEnv e -> a) -> SigEnv e -> a
-    sfgo sig (!t, !d, e) = sig (f t, df d, e)
+    sfgo sig (!t, d, e) = sig (f t, df d, e)
 
 -- | Have a node start emitting at a start time (and possibly end after some duration), else
 -- emitting a default empty value outside the allowed timespan.
@@ -508,10 +515,10 @@ piecewiseMono t0 empt nodesDurs = out
   -- the state function for the node. check the start time of the next node and switch to it
   -- and consume one node from the list if its time is here, otherwise just keep playing the
   -- current node
-  gogo r@(!t, _, _) (currNode, !currStart, !currDur, nil@[]) = do
+  gogo r@(t, _, _) (currNode, !currStart, !currDur, nil@[]) = do
     (MkS2 x new_currNode) <- if t < currStart + currDur then runNode r currNode else pure $ MkS2 empt currNode
     pure $ MkS2 x (new_currNode, currStart, currDur, nil)
-  gogo r@(!t, _, _) s@(currNode, !currStart, currDur, ls@((nextNode, !nextStart, nextDur):rest))
+  gogo r@(t, _, _) s@(currNode, currStart, currDur, ls@((nextNode, !nextStart, nextDur):rest))
     | t < currStart = pure $ MkS2 empt s
     | t < nextStart = runNode r currNode <&> \(MkS2 x new_currNode) -> MkS2 x (new_currNode, currStart, currDur, ls)
     | otherwise = nextStart `seq` nextDur `seq` rest `seq`
@@ -542,58 +549,12 @@ cascade :: (Foldable f, Functor f, Num a)
         -> Node e a
 cascade t0 empt = sum . fmap (\(node, sta, du) -> startAt empt (t0 + sta) du node)
 
--- | A setting for `retriggerWith` determining whether to cut the cell's envelope when we're
--- at its duration (which is `EnvelopeCutsAtCellDuration`) or let the envelope finish.
-data EnvelopeCellDurationMode = EnvelopeIgnoresCellDuration | EnvelopeCutsAtCellDuration
-  deriving (Eq, Show, Ord)
-
--- | A setting for `retriggerWith` determining if the cells will be monophonic or polyphonic
--- (i.e. cells can play over each other) as cells do specify their start time & can overlap.
--- If `RetrigMonophonic`, we'll sort the cell list by start time and queue them back to back
--- ignoring all cell durations except for the last one.  If `RetrigPolyphonic`, we'll simply
--- schedule all cells to start at their specified start (and possibly end) time, and summing
--- up the resulting nodes (letting them play over each other freely.)
-data RetriggerMode = RetrigMonophonic | RetrigPolyphonic
-  deriving (Eq, Show, Ord)
-
--- | Render a `Cell` into a `Node` of `LiveCell`. This is where we'll do \"effect commands\"
--- on cells by rendering them into a `Node` of time-varying freq/ampl/env/pan parameters.
-renderCell :: Cell -> Node e LiveCell
-renderCell cell = share $ adsr' cell.adsr <&> \currEnvValue -> MkLC
-  { freq = cell.freq
-  , ampl = cell.ampl
-  , pan = cell.pan
-  , env = currEnvValue
-  }
-
--- | Play a melody (a list of `Cell`) with a synth (a node parameterized by @`Node` `Freq`@,
--- @`Node` `Ampl`@). Effectively \"resets and retriggers\" a node in sync with note data.
-retriggerWith :: EnvelopeCellDurationMode
-                -- ^how to treat envelope vs. cell duration, see docs for this type
-              -> RetriggerMode -- ^monophonic or polyphonic triggering
-              -> TimeVal -- ^a start time for this retriggering sequence
-              -> LR SynthVal -- ^empty value for when notes have concluded
-              -> (Node e LiveCell -> Node e (LR SynthVal))
-                -- ^instrument to retrigger. An instrument is parameterized by `LiveCell`s.
-              -> [Cell] -- ^note data cells making up the melody
-              -> Node e (LR SynthVal)
-retriggerWith envCellDurMode retrigMode t0 empt instrument cells = out
-  where
-    out = case retrigMode of
-      RetrigMonophonic -> piecewiseMono t0 empt $ sortOn (\(_, sta, _) -> sta) nodesDurs
-      RetrigPolyphonic -> share $ piecewisePoly t0 empt nodesDurs
-    ~nodesDurs = cells <&> \cell -> let
-      du = case envCellDurMode of
-        EnvelopeIgnoresCellDuration -> max (adsrTotalTime cell.adsr) cell.dur
-        EnvelopeCutsAtCellDuration -> cell.dur
-      ~node = instrument $ renderCell cell
-      in (node, cell.start, du)
-
 --------------------------------------------------------------------------------
 -- ** Envelopes
 
 -- | Pure function for `funcRamp`
 _funcRamp_fn :: (Num v, Ord v) => (TimeVal -> v) -> TimeVal -> v -> v -> TimeVal -> v
+{-# SPECIALIZE _funcRamp_fn :: (TimeVal -> SynthVal) -> TimeVal -> SynthVal -> SynthVal -> TimeVal -> SynthVal #-}
 _funcRamp_fn f du sta end t = let
   downramp = sta > end
   MkS2 smaller bigger = if downramp then MkS2 end sta else MkS2 sta end
@@ -605,13 +566,15 @@ _funcRamp_fn f du sta end t = let
 -- be @\t -> t@; For a quadratic ramp, the function is @\t -> t*t@ etc.
 funcRamp :: (Num v, Ord v) => (TimeVal -> v) -> TimeVal -> v -> v -> Node e v
 funcRamp f du sta end = if du == 0 then pure end else nTime <&> _funcRamp_fn f du sta end
+{-# INLINABLE funcRamp #-}
+{-# SPECIALIZE funcRamp :: (TimeVal -> SynthVal) -> TimeVal -> SynthVal -> SynthVal -> Node e SynthVal #-}
 
 -- | Specialization of funcRamp to a linear function
 linearRamp :: TimeVal -> SynthVal -> SynthVal -> Node e SynthVal
 linearRamp = funcRamp id
 
 -- | Create a signal traversing an ADSR envelope according to some fixed envelope params.
-adsr' :: ADSRParams -> Node e SynthVal
+adsr' :: ADSRParams -> Node e Percent
 adsr' (ADSR tA tD tS tR v0 v1 v2) = let
   dA = (1.0 - v0) / tA
   dD = (v1 - 1.0) / tD
@@ -628,7 +591,7 @@ adsr' (ADSR tA tD tS tR v0 v1 v2) = let
   in share $ MkNode0_ sig
 
 -- | Convenience shorthand for `adsr'` on an `ADSR` literal.
-adsr :: TimeVal -> TimeVal -> TimeVal -> TimeVal -> SynthVal -> SynthVal -> SynthVal -> Node e SynthVal
+adsr :: TimeVal -> TimeVal -> TimeVal -> TimeVal -> Percent -> Percent -> Percent -> Node e Percent
 adsr tA tD tS tR v0 v1 v2 = adsr' $ ADSR tA tD tS tR v0 v1 v2
 {-# INLINABLE adsr #-}
 
@@ -644,9 +607,9 @@ isNaN a = a /= a
 -- a node. Note that this works fairly differently from `adsr'`: ADSR parameters here
 -- are variable so we have to keep the envelope state, incrementing it with a slope computed
 -- using the latest received ADSR parameters.
-adsr'N :: Node e ADSRParams -> Node e SynthVal
+adsr'N :: Node e ADSRParams -> Node e Percent
 adsr'N = mkNode1 (MkS2 nan Nothing) $
-  \(!t, !d, _) (ADSR tA tD tS tR v0 v1 v2) (MkS2 x' precalcs') -> let
+  \(!t, d, _) (ADSR tA tD tS tR v0 v1 v2) (MkS2 x' precalcs') -> let
     -- using NaN as a (Nothing :: Maybe Double) to not have to waste resources on Just unbox
     -- but this won't generalize to all choices of SynthVal...  but realistically it's fine?
     x = if isNaN x' then v0 else x'
@@ -658,7 +621,7 @@ adsr'N = mkNode1 (MkS2 nan Nothing) $
       , d * (v2 - v1) / tR
       , tA + tD + tS + tR
       ) id precalcs'
-    (!mA, !mD, !t0S, !t0R, !mR, !tEnd) = precalcs
+    (mA, mD, t0S, t0R, mR, tEnd) = precalcs
     -- (deltaTime * attackSlope, deltaTime * decaySlope, sustainStartT, releaseStartT, deltaTime * releaseSlope)
     newX = if | t < tA -> x + mA
               | t < t0S -> x + mD
@@ -694,10 +657,10 @@ _sinOsc_fn :: TimeVal -> Ampl -> Freq -> Phase -> Percent -> SPair SynthVal Perc
 _sinOsc_fn d a f phase s = _osc_fn d f s $ \x -> a * sin (twopi * x + phase)
 
 _sinOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
-_sinOsc_SF (_, !d, _) a f = _sinOsc_fn d a f 0
+_sinOsc_SF (_, d, _) a f = _sinOsc_fn d a f 0
 
 _sinOscPM_SF :: SigEnv e -> Ampl -> Freq -> Phase -> Percent -> SPair SynthVal Percent
-_sinOscPM_SF (_, !d, _) a f phase = _sinOsc_fn d a f phase
+_sinOscPM_SF (_, d, _) a f phase = _sinOsc_fn d a f phase
 
 -- | Sine oscillator taking amplitude and frequency as input nodes.
 sinOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
@@ -712,10 +675,10 @@ _sqrOsc_fn :: TimeVal -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Pe
 _sqrOsc_fn d a f duty s = _osc_fn d f s $ \x -> if x <= duty then (-a) else a
 
 _sqrOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
-_sqrOsc_SF (_, !d, _) a f = _sqrOsc_fn d a f 0.5
+_sqrOsc_SF (_, d, _) a f = _sqrOsc_fn d a f 0.5
 
 _sqrOscDM_SF :: SigEnv e -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
-_sqrOscDM_SF (_, !d, _) a f duty = _sqrOsc_fn d a f duty
+_sqrOscDM_SF (_, d, _) a f duty = _sqrOsc_fn d a f duty
 
 -- | Square oscillator taking amplitude and frequency as input nodes.
 sqrOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
@@ -734,13 +697,13 @@ _sawOsc_fn :: TimeVal -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Pe
 _sawOsc_fn d a f skew s = _osc_fn d f s $ _saw_fn a skew
 
 _sawOscSM_SF :: SigEnv e -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
-_sawOscSM_SF (_, !d, _) a f = _sawOsc_fn d a f
+_sawOscSM_SF (_, d, _) a f = _sawOsc_fn d a f
 
 _sawOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
-_sawOsc_SF (_, !d, _) a f = _sawOsc_fn d a f 1.0
+_sawOsc_SF (_, d, _) a f = _sawOsc_fn d a f 1.0
 
 _triOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
-_triOsc_SF (_, !d, _) a f = _sawOsc_fn d a f 0.5
+_triOsc_SF (_, d, _) a f = _sawOsc_fn d a f 0.5
 
 -- | Saw oscillator taking amplitude and frequency as input nodes.
 sawOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
@@ -756,7 +719,7 @@ sawOscSM = mkNode3 _osc_s0 _sawOscSM_SF
 
 -- | `triOsc` with \"phase modulation\", almost like a \"coarser\", tri-shaped `sinOscPM`.
 triOscPM :: Node e Ampl -> Node e Freq -> Node e Phase -> Node e SynthVal
-triOscPM = let r2pi = recip twopi in mkNode3 _osc_s0 $ \(_, !d, _) a f phase s ->
+triOscPM = let r2pi = recip twopi in mkNode3 _osc_s0 $ \(_, d, _) a f phase s ->
   _osc_fn d f s $ \x -> _saw_fn a 0.5 (x + phase * r2pi)
 
 --------------------------------------------------------------------------------
@@ -857,24 +820,19 @@ lpfN = cookbookFilterN cookbookCoeffsFn_LPF
 -- (More efficient, fused implementation of `echo`.)
 echo' :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
 echo' delayMs decayMult wetLvl filterQ filterF wetPan = let delaySec = delayMs * 0.001; dryLvl = max 0 (1 - wetLvl)
-  in flip (MkNode2IO (MkS2 DelayQueue.dummy _cookbookFilter_s0)) (pure ()) $ \r@(_, d, _) _ x (MkS2 savedDQ filterState) -> do
-    dq <- DelayQueue.unDummy (round $ delaySec / d) zeroLR savedDQ
-    delayOut <- DelayQueue.pop zeroLR dq
-    let delayIn = x + (decayMult .*: delayOut)
-    DelayQueue.push delayIn dq
-    let (MkS2 filteredDelayOut filterState') = _cookbookFilter_SF cookbookCoeffsFn_LPF filterQ filterF r delayOut filterState
-    pure $ MkS2 ((dryLvl .*: x) + balanceLR wetPan (wetLvl .*: filteredDelayOut)) (MkS2 dq filterState')
+  in mkNode1IO (MkS2 DelayQueue.delay_s0 _cookbookFilter_s0) $ \r@(_, d, _) x (MkS2 myDQ filterState) ->
+    DelayQueue.withDelay delaySec decayMult d myDQ x $ \dq delayOut _ -> let
+      (MkS2 filteredDelayOut filterState') = _cookbookFilter_SF
+        cookbookCoeffsFn_LPF filterQ filterF r delayOut filterState
+      in pure $ MkS2 ((dryLvl .*: x) + balanceLR wetPan (wetLvl .*: filteredDelayOut))
+        (MkS2 dq filterState')
 
 -- | Single-stream echo with constant delay time and decay multiplier. This produces the raw
 -- echo wet signal; do your own mixing and filtering afterwards (or use `echo`.)
 echoRaw :: TimeVal -> Ampl -> Node e (LR SynthVal) -> Node e (LR SynthVal)
 echoRaw delayMs decayMult = let delaySec = delayMs * 0.001
-  in flip (MkNode2IO DelayQueue.dummy) (pure ()) $ \(_, d, _) _ x savedDQ -> do
-    dq <- DelayQueue.unDummy (round $ delaySec / d) zeroLR savedDQ
-    delayOut <- DelayQueue.pop zeroLR dq
-    let delayIn = x + (decayMult .*: delayOut)
-    DelayQueue.push delayIn dq
-    pure $ MkS2 delayOut dq
+  in mkNode1IO DelayQueue.delay_s0 $ \(_, d, _) x myDQ ->
+    DelayQueue.withDelay delaySec decayMult d myDQ x $ \dq delayOut _ -> pure $ MkS2 delayOut dq
 
 -- | Single-stream echo with constant delay time, decay multiplier, wet mix level (0-1), low
 -- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.

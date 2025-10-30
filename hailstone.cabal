@@ -17,25 +17,30 @@ flag audio-backend-sdl
   manual:             True
   -- manual: True means cabal won't retry with the flag set to True if the build fails
 
+common ghcflags
+  ghc-options: -Wall -O3 -threaded -optc-O3 -fexcess-precision
+
 library
+  import:             ghcflags
   hs-source-dirs:     src
-  ghc-options:        -Wall -O2 -threaded
   default-language:   Haskell2010
   exposed-modules:    Sound.Hailstone.Synth
                     , Sound.Hailstone.Types
-                    , Sound.Hailstone.VoiceAlloc
                     , Sound.Hailstone.Types.LR
                     , Sound.Hailstone.DelayQueue
-  build-depends:      base >= 4.7 && < 5
+                    , Sound.Hailstone.VoiceAlloc
+                    , Sound.Hailstone.Sequencing
+  build-depends:      base >= 4.19 && < 5
                     , array
 
 executable hailstone-scratch
+  import:             ghcflags
   hs-source-dirs:     exe
   main-is:            ScratchMain.hs
   other-modules:      Sound.Hailstone.Backends.Common
-  ghc-options:        -Wall -O2 -threaded -rtsopts -with-rtsopts "-N -maxN2 -H20m"
+  ghc-options:        -rtsopts -with-rtsopts "-N -maxN2 -H20m"
   default-language:   Haskell2010
-  build-depends:      base >= 4.7 && < 5
+  build-depends:      base >= 4.19 && < 5
                     , hailstone
                     , array
 

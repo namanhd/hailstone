@@ -37,11 +37,11 @@ peekMin Empt = Nothing
 peekMin (Bin _ v a _ _) = Just (v, a)
 
 -- | Sort using a min-heap, since we might as well just write this. /O(n log n)/
-heapsort :: (Foldable f, Ord v) => f v -> [v]
-heapsort vs = go $ foldl' (\heap v -> insert v v heap) Empt vs
-  where
-    go Empt = []
-    go h@(Bin _ v _ _ _) = v : (go $ deleteMin h)
+-- heapsort :: (Foldable f, Ord v) => f v -> [v]
+-- heapsort vs = go $ foldl' (\heap v -> insert v v heap) Empt vs
+--   where
+--     go Empt = []
+--     go h@(Bin _ v _ _ _) = v : (go $ deleteMin h)
 
 -- | Given items on a timeline, each @(a, start, duration)@, separate them into sublists
 -- where each sublist has only non-overlapping items on the timeline. /O(n log n)/, though I

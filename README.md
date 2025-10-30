@@ -131,7 +131,7 @@ will create a node that
 Built on top of `piecewisePoly`, the function `retriggerWith` plays a melody
 using a "synth/instrument". This is done by "restarting" an instrument node on every new note, rather than letting the instrument sound evolve independently of the notes.
 
-An *instrument* is any function parameterized by a Node emitting `LiveCell` values. A `LiveCell` describes the instantaneous playing parameters of a note, such as pitch, volume/amplitude, envelope progress, and potentially other values; a stream of `LiveCell` is rendered from the higher-level static `Cell` specification of a note.
+An *instrument* is any function parameterized by a Node emitting `Now` values. A `Now` describes the instantaneous playing parameters of a note, such as pitch, volume/amplitude, envelope progress, and potentially other values; a stream of `Now` is rendered from the higher-level static `Cell` or `ArticulatedCell` specification of a note.
 
 This way, instruments/synths can react in their own way to a note's volume, envelope, or any other high-level modulating parameter. We'll also have room to implement e.g. note-level effects with per-note parameters such as per-note
 vibrato or portamento.

@@ -20,8 +20,6 @@ module Sound.Hailstone.Types
 , SampleRate, SampleVal
   -- ** Note data & config
 , ChanMode(..)
-, Cell(..)
-, LiveCell(..)
 , ADSRParams(..)
 , adsrTotalTime
   -- ** For RBJ audio EQ cookbook 2nd-order filters
@@ -74,38 +72,6 @@ type TimeVal = SynthVal
 -- signed integer audio.
 type SampleVal = Int16
 
--- | Note data cell; stores some basic playing properties of a note.
-data Cell = MkC
-  { freq :: !Freq -- ^Frequency of the note
-  , ampl :: !Ampl -- ^Amplitude of the note as a linear multiplier (should be between 0 and 1)
-  , start :: !TimeVal -- ^Start time of the note in seconds.
-  , dur :: !TimeVal
-  -- ^Duration of the note in seconds, which needs not equal the `adsrTotalTime` of `_adsr`;
-  -- this will, however, be the duration after which the cell is hard cut off.
-  , pan :: !Pan
-  -- ^Pan of a note, 0 is hard left, 0.5 is center, 1 is hard right.
-  , adsr :: !ADSRParams
-  -- ^ The envelope settings for this note.
-  }
-  deriving (Show, Eq)
-
--- | A "live cell" is what an instrument will receive from a `Node` to play a note specified
--- by a `Cell`, which describes high-level static information. The `Cell` might specify some
--- varying frequency or ampl (per-note portamento, vibrato, or volume slide effect) and this
--- is reflected as time-varying `LiveCell`s emitted to the instrument upon every new sample.
--- There may be more metadata here such as arbitrary modulation values that can be mapped to
--- any parameter in the instrument, like ModX & ModY on notes wrt. FL Studio native plugins.
-data LiveCell = MkLC
-  { freq :: !Freq -- ^ current frequency
-  , ampl :: !Ampl -- ^ current amplitude
-  , pan :: !Pan -- ^ current pan
-  , env :: !SynthVal -- ^ current value of the envelope
-  } deriving (Show, Eq)
-
--- TODO : generalized Cell that has puts all of these fields in nodes. That
--- way.... we can embed entire VOICES, and PATTERNS, into Cells. So we get a
--- playlist view/pattern sequencing mechanism, for free...
-
 -- | Attack-decay-sustain-release envelope parameters. Values of type `SynthVal`
 -- used here, which are "levels" or "gains", are between 0 and 1 inclusive.
 data ADSRParams = ADSR
@@ -117,11 +83,11 @@ data ADSRParams = ADSR
     -- ^Sustain time
   , tR :: !TimeVal
     -- ^Time taken to release from sustain level to end level
-  , v0 :: !SynthVal
+  , v0 :: !Percent
     -- ^The starting level for the envelope
-  , v1 :: !SynthVal
+  , v1 :: !Percent
     -- ^Sustain level
-  , v2 :: !SynthVal
+  , v2 :: !Percent
     -- ^End level
   } deriving (Show, Eq)
 
