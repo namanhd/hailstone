@@ -20,7 +20,7 @@ import GHC.Exts (tryTakeMVar#)
 import qualified GHC.Base
 import qualified GHC.MVar
 
-import Sound.Hailstone.Synth
+import Sound.Hailstone.Synth.Node
 import qualified Data.Array.IO as Array
 
 -- | single-producer single-consumer bounded unboxed concurrent queue / ring buffer

@@ -24,14 +24,23 @@ library
   import:             ghcflags
   hs-source-dirs:     src
   default-language:   Haskell2010
-  exposed-modules:    Sound.Hailstone.Synth
-                    , Sound.Hailstone.Types
-                    , Sound.Hailstone.Types.LR
-                    , Sound.Hailstone.DelayQueue
-                    , Sound.Hailstone.VoiceAlloc
+  exposed-modules:    Sound.Hailstone.Synth.Node
+                    , Sound.Hailstone.Synth.Generators
+                    , Sound.Hailstone.Synth.Effects
+                    , Sound.Hailstone.Synth.LR
+                    , Sound.Hailstone.Synth.SynthVal
+                    , Sound.Hailstone.Synth.DelayQueue
+                    , Sound.Hailstone.Synth.MiscTypes
                     , Sound.Hailstone.Sequencing
+                    , Sound.Hailstone.Sequencing.Cell
+                    , Sound.Hailstone.Sequencing.CellScoreBuild
+                    , Sound.Hailstone.Sequencing.Now
+                    , Sound.Hailstone.VoiceAlloc
   build-depends:      base >= 4.19 && < 5
                     , array
+                    , mtl
+                    , containers
+                    , text
 
 executable hailstone-scratch
   import:             ghcflags

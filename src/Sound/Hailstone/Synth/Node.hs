@@ -12,7 +12,7 @@
 {-# LANGUAGE PolyKinds #-} -- needed for the HasField instance to be usable, apparently
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module Sound.Hailstone.Synth
+module Sound.Hailstone.Synth.Node
 ( -- * Audio nodes
   --
   -- | An audio `Node` is a unit of computation with a state, and carries a signal function
@@ -25,7 +25,12 @@ module Sound.Hailstone.Synth
   -- The audio node /tree/ can become an audio node /graph/ (a DAG, to be specific) with the
   -- use of `share`, which uses sorcery to enable /observable sharing/, letting the embedded
   -- DSL see the sharing semantics, the let-bindings & usage of names, of the host language.
-  Node(..)
+  -- 
+  -- This module contains the definition of the `Node` type, its instances, and a prelude of
+  -- basic functions creating and operating on `Node`s. 
+  -- See "Sound.Hailstone.Synth.Generators" for generator nodes (oscillators), and
+  -- "Sound.Hailstone.Synth.Effects" for effect nodes.
+  Node(..), SigEnv
   -- *** Convenient derived constructors
 , mkNode1, mkNode1IO, mkNode3, mkNode4_
   -- ** Observable sharing
@@ -37,28 +42,25 @@ module Sound.Hailstone.Synth
   -- ** Numeric and stereo conversions
 , asPCM, stereodup, monosum, mono2stereo, stereo2mono, mapLRNode, balance
   -- ** Sequencing
-, startAt, piecewiseMono, piecewisePoly, cascade
+, startWithDurAndEmpty, startAt, piecewiseMono, piecewisePoly, cascade
   -- ** Envelopes
 , adsr', adsr'N, adsr
 , funcRamp, linearRamp
-  -- ** Generators
-, sinOsc, sinOscPM, sqrOsc, sqrOscDM, sawOsc, triOsc, triOscPM, sawOscSM
-  -- ** Effects
-, gain, gainN
-, echoRaw, echo, echo'
-  -- *** Filters à la RBJ's audio EQ cookbook
-, lpf, lpfN
   -- * Re-exports
-, module Sound.Hailstone.Types
+, module Sound.Hailstone.Synth.SynthVal
+, module Sound.Hailstone.Synth.LR
+, module Sound.Hailstone.Synth.MiscTypes
 )
 where
 
 import Prelude hiding (isNaN)
 import Data.Ord (clamp)
 import Data.Functor ((<&>))
-import Sound.Hailstone.Types
+
+import Sound.Hailstone.Synth.SynthVal
+import Sound.Hailstone.Synth.LR
+import Sound.Hailstone.Synth.MiscTypes
 import qualified Sound.Hailstone.VoiceAlloc as VoiceAlloc
-import qualified Sound.Hailstone.DelayQueue as DelayQueue
 
 -- dark magic for observable sharing
 import System.IO.Unsafe (unsafePerformIO)
@@ -419,12 +421,20 @@ modifyTime f df node = case node of
 
 -- | Have a node start emitting at a start time (and possibly end after some duration), else
 -- emitting a default empty value outside the allowed timespan.
-startAt :: a -> TimeVal -> TimeVal -> Node e a -> Node e a
-startAt empt sta du ~node' = let s = modifyTime (subtract sta) id node'
+startWithDurAndEmpty :: a -> TimeVal -> TimeVal -> Node e a -> Node e a
+startWithDurAndEmpty empt sta du ~node' = let s = modifyTime (subtract sta) id node'
   in MkNode0IO s $ \r@(!t, _, _) node -> if
     | t < sta -> pure $ MkS2 empt node
     | t < (sta + du) -> runNode r node
     | otherwise -> pure $ MkS2 empt node
+
+-- | Have a node of a @Num@ type start emitting at a start time and 0 before the start time.
+-- Actually just a convenience alias for `startWithDurAndEmpty` with infinite duration and 0
+-- for the empty value.
+startAt :: (Num a) => TimeVal -> Node e a -> Node e a
+{-# SPECIALIZE startAt :: TimeVal -> Node e SynthVal -> Node e SynthVal #-}
+{-# SPECIALIZE startAt :: TimeVal -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
+startAt sta = startWithDurAndEmpty 0 sta inf
 
 --------------------------------------------------------------------------------
 -- ** Numeric and stereo conversions
@@ -506,7 +516,7 @@ piecewiseMono t0 empt nodesDurs = out
   where
   -- assume sorted by start time, apply (t0+start) offsets to everyone
   nodesDurs' = fmap (\(node, sta, du) -> let sta' = sta + t0
-    in (startAt empt sta' du node, sta', du)) $ nodesDurs
+    in (startWithDurAndEmpty empt sta' du node, sta', du)) $ nodesDurs
   -- get initial state and form the output node
   out = case nodesDurs' of
     [] -> pure empt
@@ -547,7 +557,7 @@ cascade :: (Foldable f, Functor f, Num a)
         -> a -- ^empty value to emit when no nodes are scheduled to be playing
         -> f (Node e a, TimeVal, TimeVal) -- ^a list of @[(node, start, duration)]@
         -> Node e a
-cascade t0 empt = sum . fmap (\(node, sta, du) -> startAt empt (t0 + sta) du node)
+cascade t0 empt = sum . fmap (\(node, sta, du) -> startWithDurAndEmpty empt (t0 + sta) du node)
 
 --------------------------------------------------------------------------------
 -- ** Envelopes
@@ -595,14 +605,6 @@ adsr :: TimeVal -> TimeVal -> TimeVal -> TimeVal -> Percent -> Percent -> Percen
 adsr tA tD tS tR v0 v1 v2 = adsr' $ ADSR tA tD tS tR v0 v1 v2
 {-# INLINABLE adsr #-}
 
--- | @NaN@ literal
-nan :: SynthVal
-nan = 0 / 0
-
--- | the Prelude @isNaN@ goes through some unsafe IO primop, this is probably faster
-isNaN :: SynthVal -> Bool
-isNaN a = a /= a
-
 -- | A node-parameterized version of `adsr'` which can take `ADSRParams` emitted from
 -- a node. Note that this works fairly differently from `adsr'`: ADSR parameters here
 -- are variable so we have to keep the envelope state, incrementing it with a slope computed
@@ -631,216 +633,3 @@ adsr'N = mkNode1 (MkS2 nan Nothing) $
     newS = MkS2 newX (case precalcs' of Nothing -> Just precalcs; _ -> precalcs')
     -- clamp output to be between 0 and 1
     in MkS2 newX newS
-
---------------------------------------------------------------------------------
--- ** Generators
-
-twopi :: SynthVal
-twopi = 2 * pi
-
--- | generic oscillator function with \"phase\" accumulator (but \"phase\" is from 0 to 1)
-_osc_fn :: TimeVal -> Freq -> Percent -> (Percent -> SynthVal) -> SPair SynthVal Percent
-_osc_fn d f myProgress k = let
-  progressDelta = f * d
-  newProgress' = myProgress + progressDelta
-  newProgress = if newProgress' > 1 then newProgress' - 1 else newProgress'
-  in MkS2 (k newProgress) newProgress
-  -- progress is from 0 to 1 (assuming f is never negative to not have to check <0...)
-{-# INLINE _osc_fn #-}
-
-_osc_s0 :: Percent
-_osc_s0 = 0.0
-{-# INLINE _osc_s0 #-}
-
----------- sin oscillator with adjustable phase addition
-_sinOsc_fn :: TimeVal -> Ampl -> Freq -> Phase -> Percent -> SPair SynthVal Percent
-_sinOsc_fn d a f phase s = _osc_fn d f s $ \x -> a * sin (twopi * x + phase)
-
-_sinOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
-_sinOsc_SF (_, d, _) a f = _sinOsc_fn d a f 0
-
-_sinOscPM_SF :: SigEnv e -> Ampl -> Freq -> Phase -> Percent -> SPair SynthVal Percent
-_sinOscPM_SF (_, d, _) a f phase = _sinOsc_fn d a f phase
-
--- | Sine oscillator taking amplitude and frequency as input nodes.
-sinOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
-sinOsc = MkNode2 _osc_s0 _sinOsc_SF
-
--- | `sinOsc` with phase modulation as a third input node.
-sinOscPM :: Node e Ampl -> Node e Freq -> Node e Phase -> Node e SynthVal
-sinOscPM = mkNode3 _osc_s0 _sinOscPM_SF
-
----------- square oscillator with adjustable duty cycle
-_sqrOsc_fn :: TimeVal -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
-_sqrOsc_fn d a f duty s = _osc_fn d f s $ \x -> if x <= duty then (-a) else a
-
-_sqrOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
-_sqrOsc_SF (_, d, _) a f = _sqrOsc_fn d a f 0.5
-
-_sqrOscDM_SF :: SigEnv e -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
-_sqrOscDM_SF (_, d, _) a f duty = _sqrOsc_fn d a f duty
-
--- | Square oscillator taking amplitude and frequency as input nodes.
-sqrOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
-sqrOsc = MkNode2 _osc_s0 _sqrOsc_SF
-
--- | `sqrOsc` with duty cycle as a third input node.
-sqrOscDM :: Node e Ampl -> Node e Freq -> Node e Percent -> Node e SynthVal
-sqrOscDM = mkNode3 _osc_s0 _sqrOscDM_SF
-
----------- saw oscillator with adjustable skew (0.5 = triangle, 0.0 or 1.0 = saw)
-_saw_fn :: Ampl -> Percent -> Percent -> SynthVal
-_saw_fn a skew x = let y = if x < skew then (x / skew) else (1 - x) / (1 - skew)
-  in a * (2 * y - 1)
-
-_sawOsc_fn :: TimeVal -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
-_sawOsc_fn d a f skew s = _osc_fn d f s $ _saw_fn a skew
-
-_sawOscSM_SF :: SigEnv e -> Ampl -> Freq -> Percent -> Percent -> SPair SynthVal Percent
-_sawOscSM_SF (_, d, _) a f = _sawOsc_fn d a f
-
-_sawOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
-_sawOsc_SF (_, d, _) a f = _sawOsc_fn d a f 1.0
-
-_triOsc_SF :: SigEnv e -> Ampl -> Freq -> Percent -> SPair SynthVal Percent
-_triOsc_SF (_, d, _) a f = _sawOsc_fn d a f 0.5
-
--- | Saw oscillator taking amplitude and frequency as input nodes.
-sawOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
-sawOsc = MkNode2 _osc_s0 _sawOsc_SF
-
--- | Triangle oscillator taking amplitude and frequency as input nodes.
-triOsc :: Node e Ampl -> Node e Freq -> Node e SynthVal
-triOsc = MkNode2 _osc_s0 _triOsc_SF
-
--- | `sawOsc` with skew as a third input node. (0 and 1 = saw, 0.5 = triangle)
-sawOscSM :: Node e Ampl -> Node e Freq -> Node e Percent -> Node e SynthVal
-sawOscSM = mkNode3 _osc_s0 _sawOscSM_SF
-
--- | `triOsc` with \"phase modulation\", almost like a \"coarser\", tri-shaped `sinOscPM`.
-triOscPM :: Node e Ampl -> Node e Freq -> Node e Phase -> Node e SynthVal
-triOscPM = let r2pi = recip twopi in mkNode3 _osc_s0 $ \(_, d, _) a f phase s ->
-  _osc_fn d f s $ \x -> _saw_fn a 0.5 (x + phase * r2pi)
-
---------------------------------------------------------------------------------
--- ** Effects
---
--- Effects must be either polymorphic or at least be specialized to @`LR` `SynthVal`@ rather
--- than just SynthVal.
-
--- | Convert a gain value (in decibels) to amplitude, equal to @10**(dBgain/20)@.
-gain2ampl :: Floating a => a -> a
-gain2ampl g = 10.0 ** (0.05 * g)
-{-# INLINABLE gain2ampl #-}
-
--- | `gain2ampl` specialized for nodes, spawning fewer nodes.
-nGain2ampl :: Floating a => Node e a -> Node e a
-nGain2ampl g = fmap (10.0 **) (0.05 *| g)
-{-# INLINABLE nGain2ampl #-}
-
--- | Apply constant gain (given in dB) to a node.
-gain :: Floating a => a -> Node e a -> Node e a
-gain g ~node = let a = gain2ampl g in a *| node
-{-# INLINABLE gain #-}
-
--- | Apply variable gain (given in dB, emitted from a node) to a node.
-gainN :: Floating a => Node e a -> Node e a -> Node e a
-gainN g ~node = let a = nGain2ampl g in a * node
-{-# INLINABLE gainN #-}
-
--- *** Filters à la RBJ's EQ cookbook
-
-_cookbookFilter_fn :: CookbookFilterCoeffs -> CookbookFilterState -> LR SynthVal -> CookbookFilterState
-_cookbookFilter_fn (MkCFCoeffs a0inv a1 a2 b0 b1 b2) (MkCFState xm1 xm2 _ ym1 ym2 _) x = let
-  y = a0inv .*: ((b0 .*: x) + (b1 .*: xm1) + (b2 .*: xm2) - (a1 .*: ym1) - (a2 .*: ym2))
-  in MkCFState x xm1 xm2 y ym1 ym2
-
-_cookbookFilter_nanCoeffs :: CookbookFilterCoeffs
-_cookbookFilter_nanCoeffs = MkCFCoeffs nan nan nan nan nan nan
-
-_cookbookFilter_zeroState :: CookbookFilterState
-_cookbookFilter_zeroState = MkCFState 0 0 0 0 0 0
-
-_cookbookFilter_s0 :: SPair CookbookFilterCoeffs CookbookFilterState
-_cookbookFilter_s0 = MkS2 _cookbookFilter_nanCoeffs _cookbookFilter_zeroState
-
-_cookbookFilterN_s0 :: STriple Freq CookbookFilterCoeffs CookbookFilterState
-_cookbookFilterN_s0 = MkS3 nan _cookbookFilter_nanCoeffs _cookbookFilter_zeroState
-
-_cookbookFilter_SF :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> SigEnv e -> LR SynthVal -> SPair CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (SPair CookbookFilterCoeffs CookbookFilterState)
-_cookbookFilter_SF coeffsFn q f (_, d, _) x (MkS2 savedCoeffs savedState) = let
-  c = if isNaN savedCoeffs.a0inv then coeffsFn d q f else savedCoeffs
-  s = _cookbookFilter_fn c savedState x
-  in MkS2 s.ym0 (MkS2 c s)
-
-_cookbookFilterN_SF :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> SigEnv e -> Freq -> LR SynthVal -> STriple Freq CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (STriple Freq CookbookFilterCoeffs CookbookFilterState)
-_cookbookFilterN_SF coeffsFn q (_, d, _) thisFreq x (MkS3 lastFreq savedCoeffs savedState) = let
-  c = if thisFreq == lastFreq then savedCoeffs else coeffsFn d q thisFreq
-  s = _cookbookFilter_fn c savedState x
-  in MkS2 s.ym0 (MkS3 thisFreq c s)
-
-cookbookCoeffsFn_LPF :: TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs
-cookbookCoeffsFn_LPF d q f = let
-  omega = twopi * f * d
-  cosom = cos omega
-  sinom = sin omega
-  alpha = sinom / (2 * q)
-  b0 = (1 - cosom) / 2
-  in MkCFCoeffs
-    { a0inv = recip (1 + alpha)
-    , a1 = -2 * cosom
-    , a2 = 1 - alpha
-    , b0 = b0
-    , b1 = 1 - cosom
-    , b2 = b0
-    }
-
--- | RBJ 2nd-order filter. <https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html>
--- Takes a coefficients-calculating function (which itself takes delta time, Q, frequency.)
-cookbookFilter :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-cookbookFilter coeffsFn q f = mkNode1 _cookbookFilter_s0 (_cookbookFilter_SF coeffsFn q f)
-
--- | `cookbookFilter` but with variable filter frequency from a node.
-cookbookFilterN :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Node e Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-cookbookFilterN coeffsFn q = MkNode2 _cookbookFilterN_s0 (_cookbookFilterN_SF coeffsFn q)
-
--- | 2nd-order low-pass filter.
-lpf :: SynthVal -> Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-lpf = cookbookFilter cookbookCoeffsFn_LPF
-
--- | `lpf` but with variable filter frequency.
-lpfN :: SynthVal -> Node e Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-lpfN = cookbookFilterN cookbookCoeffsFn_LPF
-
--- *** Delay, echo
-
--- | Single-stream echo with constant delay time, decay multiplier, wet mix level (0-1), low
--- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
---
--- (More efficient, fused implementation of `echo`.)
-echo' :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-echo' delayMs decayMult wetLvl filterQ filterF wetPan = let delaySec = delayMs * 0.001; dryLvl = max 0 (1 - wetLvl)
-  in mkNode1IO (MkS2 DelayQueue.delay_s0 _cookbookFilter_s0) $ \r@(_, d, _) x (MkS2 myDQ filterState) ->
-    DelayQueue.withDelay delaySec decayMult d myDQ x $ \dq delayOut _ -> let
-      (MkS2 filteredDelayOut filterState') = _cookbookFilter_SF
-        cookbookCoeffsFn_LPF filterQ filterF r delayOut filterState
-      in pure $ MkS2 ((dryLvl .*: x) + balanceLR wetPan (wetLvl .*: filteredDelayOut))
-        (MkS2 dq filterState')
-
--- | Single-stream echo with constant delay time and decay multiplier. This produces the raw
--- echo wet signal; do your own mixing and filtering afterwards (or use `echo`.)
-echoRaw :: TimeVal -> Ampl -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-echoRaw delayMs decayMult = let delaySec = delayMs * 0.001
-  in mkNode1IO DelayQueue.delay_s0 $ \(_, d, _) x myDQ ->
-    DelayQueue.withDelay delaySec decayMult d myDQ x $ \dq delayOut _ -> pure $ MkS2 delayOut dq
-
--- | Single-stream echo with constant delay time, decay multiplier, wet mix level (0-1), low
--- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
---
--- Less efficient but more readable and extensible implementation of `echo'`.
-echo :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-echo delayMs decayMult wetLvl filterQ filterF wetPan input = output
-  where
-    input' = share input
-    filteredDelayOut = lpf filterQ filterF $ echoRaw delayMs decayMult input'
-    output = (1 - wetLvl) *|| input' + (balance wetPan $ wetLvl *|| filteredDelayOut)

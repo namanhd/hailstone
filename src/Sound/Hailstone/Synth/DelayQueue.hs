@@ -5,12 +5,14 @@
 {-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 
-module Sound.Hailstone.DelayQueue
+module Sound.Hailstone.Synth.DelayQueue
 (delay_s0, withDelay)
 where
 
 import qualified Data.Array.IO as IOA
-import Sound.Hailstone.Types
+import Sound.Hailstone.Synth.SynthVal
+import Sound.Hailstone.Synth.LR
+import Sound.Hailstone.Synth.MiscTypes (SPair(..))
 
 -- | specialized to unboxed types... maybe we could also write this as a data family so that
 -- it can choose between "Data.IOA.IO" and "Data.IOA.Storable" depending on if the thing

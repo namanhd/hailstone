@@ -19,7 +19,7 @@ import System.Mem (performGC)
 import Data.Word (Word16)
 import Control.Concurrent
 import qualified Sound.Hailstone.Backends.Common as Common
-import Sound.Hailstone.Synth
+import Sound.Hailstone.Synth.Node
 
 data HailstoneAudioHandle e = MkHAH
   { _HAHsdlAudioDevice :: SDL.AudioDevice

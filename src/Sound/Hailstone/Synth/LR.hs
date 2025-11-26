@@ -18,7 +18,7 @@
 --
 -- Inspired by the type family approach of
 -- <https://github.com/mikeizbicki/simd/blob/master/src/Data/SIMD/SIMD2.hs>
-module Sound.Hailstone.Types.LR
+module Sound.Hailstone.Synth.LR
 ( LR
 , mkLR, withLR, dupLR, hsumLR, mapLR, liftA2LR, zeroLR, (.+:), (.*:), balanceLR
 )

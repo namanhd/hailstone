@@ -11,7 +11,11 @@ Audio synthesis + song composition embedded languages.
 ### Signal functions and Nodes
 The modular audio system consists of `Node`s, which are a tree-like structure, though a directed acyclic graph of audio nodes (nodes forking output to multiple nodes) can be represented with `share` (more on this later.)
 
-Each `Node e x` packages a state `s` together with a "signal function" that reads the signal environment (i.e. current time, sample rate, and other outside-world information `e`), its current state `s`, optionally an "argument" `a` emitted from some input/argument `Node a`, and returns an emitted value `x` and an updated state.
+Each `Node e x` packages a state `s` together with a "signal function" that
+reads the signal environment (i.e. current time, sample rate, and other
+outside-world information `e`), its current state `s`, optionally an "argument"
+`a` emitted from some input/argument `Node a`, and returns an emitted value `x`
+and an updated state.
 
 A signal function thus has the approximate type
 ```haskell
@@ -19,24 +23,20 @@ SigEnv e -> a -> s -> (x, s)
 ```
 where `type SigEnv e = (TimeVal, TimeVal, e)`.
 
-> This is essentially the `Reader` monad together with the `State` monad.
+> This is the `Reader` monad together with the `State` monad. This is also the
+> function describing a Mealy machine.
 > ```haskell
 > type SFr e a s x = ReaderT (SigEnv e, a) (State s) x
 > ```
-> We don't actually write it as this monad stack in the code. This has a small cost and in this setting we need as little allocation and GC pressure as possible. Plus all the signal functions are written as pure functions that don't really need the ergonomic niceties offered by the `Reader` and `State` methods anyway.
+> We don't actually write it as this monad stack in the code; it has a small
+> cost, and we don't explicitly use the reader and state methods offered by the
+> mtl types.
 
-But a unit of audio processing isn't just a function, it is a function bundled with
-*persistent* state, just like how things go in OOP-land. Indeed many synthesis algorithms
-depend on holding a running state as the audio node gets queried for new samples.
-
-We'll need a way to make these nodes compose together as if they were pure values and
-functions *yet* keep their running state as they use each other's values for complicated
-signal processing graphs.
-
-We define what amounts to an abstract syntax tree-like structure that decides the "term
-grammar" of a "language". Each constructor in such a tree type represents a
-primitive/axiomatic construct that an interpreter function for this "language" must
-explicitly handle.
+We then need to define a data structure to hold these functions, their relations to each other (to compose them), and the
+persistent state they're bundled with. We define what amounts to an abstract
+syntax tree-like structure that decides the "term grammar" of a "language". Each
+constructor in such a tree type represents a primitive/axiomatic construct that
+an interpreter function for this "language" must explicitly handle.
 
 ```haskell
 data Node e x where
@@ -47,7 +47,7 @@ data Node e x where
   -- can also be used to lift, into a node, via the applicative instance, the application of
   -- a pure function @f@ to a pure argument @a@.
 ```
-> Note that the state type variable `s` does not show up on the left hand side of the data declaration. This makes `s` existentially quantified, i.e. `forall s. s -> ...`. Users of the `Node x` type cannot pattern match or know anything about the particular `s` type in use, only that it is compatible with the signal function `SF _ s x` it is bundled with.
+> Note that the state type variable `s` is existentially quantified. Users of the `Node x` type cannot pattern match or know anything about the particular `s` type in use, only that it is compatible with the signal function it is bundled with.
 >
 > This makes sense, as implementations of audio nodes need not expose to the outside world what their internal state is or how it is used. Different nodes in a node graph are sure to have different state needs internally, so it is only natural to hide `s` away rather than having it be parameterized in the datatype i.e. `Node e s x`.
 >
@@ -66,7 +66,7 @@ runNode r node = case node of
     in (x, MkNode2 new_s sig new_aNode new_bNode)
 ```
 
-The implementation in `Sound/Hailstone/Synth.hs` has more specialized constructors and function types for efficiency (to not require dummy state, to support mutable IO, etc), but these ideas still hold. This essentially lets us fairly directly translate object-oriented DSP code into our `Node` representation while preserving composability on the surface with the provided nodes and combinators.
+The implementation in `Sound/Hailstone/Synth/Node.hs` has more specialized constructors and function types for efficiency (to not require dummy state, to support mutable IO, etc), but these ideas still hold. This essentially lets us fairly directly translate object-oriented DSP code into our `Node` representation while preserving composability on the surface with the provided nodes and combinators.
 
 > There's also a nice Applicative instance we get almost for free, useful for lifting pure code into nodes.
 >
@@ -131,19 +131,21 @@ will create a node that
 Built on top of `piecewisePoly`, the function `retriggerWith` plays a melody
 using a "synth/instrument". This is done by "restarting" an instrument node on every new note, rather than letting the instrument sound evolve independently of the notes.
 
-An *instrument* is any function parameterized by a Node emitting `Now` values. A `Now` describes the instantaneous playing parameters of a note, such as pitch, volume/amplitude, envelope progress, and potentially other values; a stream of `Now` is rendered from the higher-level static `Cell` or `ArticulatedCell` specification of a note.
+An *instrument* is any function parameterized by a Node emitting `Now` values. A `Now` describes the instantaneous playing parameters of a note, such as pitch, volume/amplitude, envelope progress, and potentially other values; a stream of `Now` is rendered from the higher-level static `Cell` specification of a note.
 
 This way, instruments/synths can react in their own way to a note's volume, envelope, or any other high-level modulating parameter. We'll also have room to implement e.g. note-level effects with per-note parameters such as per-note
 vibrato or portamento.
 
 ### Node graphs
 
-The Node datatype is really just a binary tree. However, audio nodes/units like the ones in the Web Audio API, or any other modular audio environment such as Pd or Max, are nodes in an *audio graph*, not just a tree. A Node should be able to direct its output to multiple nodes (i.e. have multiple parents), which is impossible to represent with a tree.
+The Node datatype is really just a binary tree. However, audio nodes or units in most APIs are in an *audio graph*, not just a tree. A Node should be able to direct its output to multiple nodes (i.e. have multiple parents), which is impossible to represent with a tree.
 
 #### Observable sharing at the EDSL level
-It turns out that we can add this feature to our tree datatype using an old EDSL-building trick, *observable sharing*, which makes visible to the embedded language the host (embedding) language's name bindings and value reuse. There's a good [writeup on this](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md) and [its implementation in reactive-banana](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/src/Reactive/Banana/Prim/High/Cached.hs), with relevant citations. All proposed realizations in Haskell involve using `unsafePerformIO` to keep a sort of private IO mutable variable in each initialization of an object to be shared.
+We can add this feature to our tree datatype using *observable sharing*, which makes visible to the embedded language the host (embedding) language's name bindings and value reuse. There's a good [writeup on this](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md) and [its implementation in reactive-banana](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/src/Reactive/Banana/Prim/High/Cached.hs), with relevant citations. Like the implementation in reactive-banana, we use `unsafePerformIO` to keep a sort of private IO mutable variable in each initialization of an object to be shared.
 
-*This is a slimy hack that breaks referential transparency* (on purpose), but it is useful, self-contained, and grants compute efficiency. In our case, as long as nodes are run via `runNode` with a properly-incremented `SigEnv`, this won't change the denotation of the program; i.e. using `share` should not change the resulting audio; it merely improves performance.
+There may be a way to clean up this `unsafePerformIO` use into something safe and proper, though this works for now. *This is a slimy hack that breaks referential transparency* (on purpose), but it is useful, self-contained, and grants compute efficiency.
+
+In our case, as long as nodes are run via `runNode` with a properly-incremented `SigEnv`, this won't change the meaning of the program; i.e. using `share` should not change the resulting audio; it merely improves performance.
 
 I've implemented this as the function `share :: Node e x -> Node e x`. In a portion of code such as
 ```haskell
@@ -174,11 +176,12 @@ echo delayMs decayMult wetLvl filterQ filterF wetPan input = output
 Of course, `share` is meant for the higher-level EDSL user-facing interface of composing nodes together.
 If one is up for the task of writing new nodes/node functions (such as the library implementer, or an enterprising EDSL user), the better way is to directly write a new node function with this logic in the signal function itself.
 
-For instance, one could define a bespoke "fused" node implementing the `echo` example. Its signal function might use the same value from an argument node for multiple math operations. Inside the signal function is normal pure Haskell code operating on real values, so normal, expected sharing semantics apply. Check out `echo'` in `Sound.Hailstone.Synth` to see this implementation.
+For instance, one could define a bespoke "fused" node implementing the `echo` example. Its signal function might use the same value from an argument node for multiple math operations. Inside the signal function is normal pure Haskell code operating on real values, so normal, expected sharing semantics apply. Check out `echo'` in `Sound.Hailstone.Synth.Effects` to see this implementation.
 
 
 ## Composition
-TODO!
+See `src/Sound/Hailstone/Sequencing/CellScoreBuild.hs` for a prototype DSL for stateful sequencing.
+Writeup TODO.
 
 
 ## Audio backend
@@ -192,7 +195,7 @@ buffer in time for when it's needed for playback.
 
 *Generating samples only within the audio callback is way too brittle and prone to GC stops.* This causes underruns and crackling even at very high buffer sizes.
 
-Instead, we run a separate "producer" thread that writes samples to a concurrent channel/queue/ringbuffer. 
+Instead, we run a separate "producer" thread that writes samples to a concurrent channel/queue/ringbuffer.
 Then, a backend audio callback's only job is to be the "consumer" of that queue, copying samples over to a buffer to be played.
 
 This is a cushion that lets our sample-generating node graph be free to run ahead of the backend-fired audio callback, so that any lag or GC hiccup during sample generation has minimal effect on audio consistency. *As long as the producer thread maintains a consistent lead over the audio callback*, there won't be any underruns due to instantaneous producer-side hiccups.
@@ -212,7 +215,7 @@ These settings are in the `hailstone.cabal` file as the default rtsopts to compi
 #### SIMD math
 Effects processing is basically specialized for stereo pairs of `Double`s, which allows for some further hand-rolled optimizations.
 
-Specifically, I've defined specialized unboxed SIMD representations of the stereo pair type. (This really has less to do with speeding up arithmetic and more to do with reducing boxing as much as possible, since the GC is the enemy of real-time audio here.) The code for this is in `Sound.Hailstone.Types.LR`; this has only very recently been feasible with the native code generator starting from GHC 9.12.x.
+Specifically, I've defined specialized unboxed SIMD representations of the stereo pair type. (This really has less to do with speeding up arithmetic and more to do with reducing boxing as much as possible, since the GC is the enemy of real-time audio here.) The code for this is in `Sound.Hailstone.Synth.LR`; this has only very recently been feasible with the native code generator starting from GHC 9.12.x.
 
 ### Offline/other backends
 
@@ -225,7 +228,7 @@ It is really hard to get predictable, fast performance for live audio applicatio
 That said, with some effort in adding strictness annotations, specializing, reducing boxing and representing state using simpler types, we can reduce space leaks and relieve GC lag.
 
 ## Organization
-The library is in `src/`, and has no dependencies other than `base` and `array` at the moment. You can load the `Sound.Hailstone.Synth` module in GHCi or another Main to try it out directly, no external package installations needed.
+The library is in `src/`, and has no dependencies outside of the Haskell hierarchical libraries you already have (`array` for the core synthesis; `text`, `mtl` for the sequencing DSL). You can load the `Sound.Hailstone.Synth.Node` module in GHCi or another Main to try it out directly, no external package installations needed.
 
 The executable is in `exe/ScratchMain.hs`, which is where we write test songs and synths to
 play around with. It depends on `portaudio` and `array` and should be built as a project,

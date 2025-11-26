@@ -1,11 +1,16 @@
 {-# LANGUAGE OverloadedRecordDot, Strict, ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE CPP #-}
+{-# OPTIONS_GHC -Wno-unused-do-bind #-}
 -- Test main executable, for trying out songs and synths
 
 module Main where
-
-import Sound.Hailstone.Synth
+import Sound.Hailstone.Synth.Node
+import Sound.Hailstone.Synth.Generators
+import Sound.Hailstone.Synth.Effects
 import Sound.Hailstone.Sequencing
+import qualified Sound.Hailstone.Sequencing.Cell as C
+import Sound.Hailstone.Sequencing.CellScoreBuild
 
 -- the backends are interchangeable
 #ifdef HLSTN_AUDIO_BACKEND_SDL
@@ -85,7 +90,7 @@ testSong3 = let
     ]
   glideup = (adsr 0.05 0.0 999.0 0.0 (8/9) 1.0 1.0 *)
   glidedown t = (adsr 0.0 0.0 t 0.05 1.0 1.0 (15.6/16) *)
-  vib = (* (1 +| sinOsc (startAt 0.0 (b 1.0) 99 $ linearRamp (b 0.4) 0 0.015) 7))
+  vib = (* (1 +| sinOsc (startAt (b 1.0) $ linearRamp (b 0.4) 0 0.015) 7))
   kbh = (k blen)
   pl = (p * 1.2)
   aba = (a * 0.6)
@@ -128,7 +133,62 @@ testSong3 = let
       topchords 2 (5/3) 17, topchords 2 (5/3) 21, topchords (5/3) (30/16) 25, topchords (4/3) 2 29
     ] )
 
+testSong4csb :: CellScoreBuild e ()
+testSong4csb = do
+  set $ ampX 0.6
+  add $ go itvl (3/2)
+  add $ at itvl (5/6)
+  add $ at itvl (2/3)
+  add $ at itvl (5/8) <> andThen step 2
 
+  lo <- add $ at itvl (1/4) <> at ampX 1.5 <> at susX 0.2 <> andThen step 3
+
+  add $ at susX 0.2 <> andThen step 1
+
+  b <- add $ go itvl (5/6)
+  add $ go itvl (5/6)
+  add $ go itvl (8/9)
+  add $ go itvl (cents2ratio (-600)) <> at susX 0.2 <> andThen step 2
+  visit lo $ andThen step 3
+
+  c <- add $ go freq b.freq <> priv susX 0.2 <> andThen step 1
+  rep 2 $ \i -> block $ do
+    add $ go itvl (16/15)
+    add $ go itvl (3/4)
+    add $ go itvl (5/6)
+    add $ go itvl (8/9) <> andThen step (if i == 0 then 3 else 2)
+
+  visit lo $ andThen step 1
+  visit c $ go itvl (8/9)
+  add $ at itvl (5/6)
+  add $ at itvl (5/6 * 8.1/9)
+  add $ at itvl (5/6 * 8.1/9 * cents2ratio (-400)) <> andThen step 2
+  visit lo $ andThen step 1
+
+  b <- add $ go itvl (9/8)
+  add $ go itvl (5/6)
+  add $ go itvl (8/9)
+  add $ go itvl (cents2ratio (-600)) <> at susX 0.2 <> andThen step 2
+
+  add $ go freq b.freq <> go susX 0.4 <> go itvl (cents2ratio (-400))
+  add $ at itvl (5/6)
+  add $ at itvl (3/4)
+  add $ go itvl (5/8) <> andThen step 3
+
+  add $ go itvl (15/16) <> andThen step 1
+  add $ go itvl (16/15) <> go susX 0.7 <> andThen step 2
+  add $ go itvl (4/5) <> andThen step 4
+  add $ go itvl (1/2)
+
+  pure ()
+
+
+testSong4 :: [([Cell e], Node e Now -> Node e (LR SynthVal))]
+testSong4 = realizeCellScore
+  "fmkeys"
+  (MkC { C.freq=370, C.ampl=0.8, C.start=0, C.dur=0.135, C.pan=0.5, C.adsr=(ADSR 0.005 0 0.21 0.1 0.5 1.0 0.0)})
+  [("fmkeys", testSynth4)]
+  testSong4csb
 
 testSynth0 :: Node e Now -> Node e (LR SynthVal)
 testSynth0 now = finalNode
@@ -173,6 +233,20 @@ testSynth3 now = finalNode
     e = now.env
     finalNode = lpf 1.0 6200 $ mono2stereo $ e * triOscPM a f (sqrOscDM 1.0 (7 *| f) (linearRamp 0.02 1 0))
 
+testSynth4 :: Node e Now -> Node e (LR SynthVal)
+testSynth4 now = finalNode
+  where
+    f = share $ now.freq
+    a = now.ampl
+    e = share $ now.env -- note envelope current value
+    -- fWithVibrato = share $ (f * (nCents2ratio $ sinOsc 10 4))
+    fWithVibrato = f
+    sinModulator3 = adsr 0.015 0.0 0.01 0.01 0.5 1.0 0.5 * triOscPM (e) (3 *| fWithVibrato)
+      (triOsc (0.2 * e) (fWithVibrato))
+
+    sinCarrier = sinOscPM (0.8 *| a) fWithVibrato sinModulator3
+    finalNode = lpf 1.0 6000 $  mono2stereo $ e * sinCarrier
+
 tonetestmain :: IO ()
 tonetestmain = do
   let sampleRate = 44100
@@ -185,10 +259,11 @@ tonetestmain = do
     playSong = retriggerWith
       EnvelopeIgnoresCellDuration RetrigPolyphonic 0.0 0.0
     -- mixed = playNotes testSynth1 testSong2
-    (testSong3_part0, testSong3_part1) = testSong3
-    mixed = playSong [(testSong3_part0, testSynth1), (testSong3_part1, testSynth3)]
+    -- (testSong3_part0, testSong3_part1) = testSong3
+    -- mixed = playSong [(testSong3_part0, testSynth1), (testSong3_part1, testSynth3)]
+    mixed = playSong testSong4
     master = echo' 96 0.5 0.4 1.0 800 0.2 mixed
-    destNode = asPCM $ startAt 0 0.1 10 $ master
+    destNode = asPCM $ startAt 0.17 $ master
 
   putStrLn "Opening audio"
   withAudio sampleRate bufferSize chanMode () destNode $ \hah -> do

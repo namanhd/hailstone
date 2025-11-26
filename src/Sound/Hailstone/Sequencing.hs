@@ -2,9 +2,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE NoFieldSelectors #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# OPTIONS_GHC -funbox-strict-fields #-}
 
 module Sound.Hailstone.Sequencing
 ( Cell(..)
@@ -16,43 +14,9 @@ where
 
 import Data.List (sortOn)
 import Data.Functor ((<&>))
-import Sound.Hailstone.Synth
-
--- | A `Now` is what an instrument receives from a `Node` to play a `Cell`.
---
--- Varying frequency or amplitude (per-note portamento, vibrato, or volume slides) specified
--- by `Cell`'s `MkC` (non-articulated) or `MkAC` (articulated) constructors are reflected as
--- time-varying `Now` sent to the instrument upon every new sample. We can add more metadata
--- here, such as modulation knobs that can be mapped to any parameter in the instrument.
-data Now = MkNow
-  { freq :: !Freq -- ^ current frequency
-  , ampl :: !Ampl -- ^ current amplitude
-  , pan :: !Pan -- ^ current pan
-  , env :: !SynthVal -- ^ current value of the envelope
-  } deriving (Show, Eq)
-
-data Cell e =
-  MkC -- ^ non-articulated cell
-    { freq :: !Freq -- ^Frequency of the note
-    , ampl :: !Ampl -- ^Amplitude of the note as a linear multiplier (should be between 0 and 1)
-    , start :: !TimeVal -- ^Start time of the note in seconds.
-    , dur :: !TimeVal
-    -- ^Duration of the note in seconds, which can differ from `adsrTotalTime`, but whether it
-    -- or the ADSR total time gets used as the time at which the note is cut is configured via
-    -- an argument to `retriggerWith`.
-    , pan :: !Pan
-    -- ^Pan of a note, 0 is hard left, 0.5 is center, 1 is hard right.
-    , adsr :: !ADSRParams
-    -- ^ The envelope settings for this note.
-    }
-  | MkAC
-    { freqs :: !(Node e Freq)
-    , ampls :: !(Node e Ampl)
-    , start :: !TimeVal
-    , dur :: !TimeVal
-    , pans :: !(Node e Pan)
-    , env :: !(Node e Percent)
-    }
+import Sound.Hailstone.Synth.Node
+import Sound.Hailstone.Sequencing.Cell
+import Sound.Hailstone.Sequencing.Now
 
 -- | Render a `Cell` into a `Node` of `Now`. This is where we'll do \"effect commands\"
 -- on cells by rendering them into a `Node` of time-varying freq/ampl/env/pan parameters.
@@ -105,7 +69,7 @@ retriggerWith :: EnvelopeCellDurationMode
               -> TimeVal -- ^a start time for this retriggering sequence
               -> LR SynthVal -- ^empty value for when notes have concluded
               -> [([Cell e], (Node e Now -> Node e (LR SynthVal)))]
-              -- ^list of parts, each one a (cell list, instrument for this part). 
+              -- ^list of parts, each one a (cell list, instrument for this part).
               -- An instrument is parameterized by a node of `Now`s.
               -> Node e (LR SynthVal)
 retriggerWith envCellDurMode retrigMode t0 empt cellsInstrs = out
@@ -118,4 +82,3 @@ retriggerWith envCellDurMode retrigMode t0 empt cellsInstrs = out
     out = case retrigMode of
       RetrigMonophonic -> piecewiseMono t0 empt $ sortOn (\(_, sta, _) -> sta) nodesDurs
       RetrigPolyphonic -> share $ piecewisePoly t0 empt nodesDurs
-
