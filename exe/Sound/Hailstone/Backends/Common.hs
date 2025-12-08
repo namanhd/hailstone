@@ -2,6 +2,7 @@
 {-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE NoFieldSelectors #-}
 
 -- | Common code for real-time (callback-firing) backends (PortAudio, SDL audio): a producer
 -- thread that fills an (unboxed) concurrent channel with samples, and a consumer loop to be
@@ -73,12 +74,12 @@ tryTakeMVarWithDefault (GHC.MVar.MVar m) dflt = GHC.Base.IO $ \s -> case tryTake
 -- | loop body for producer thread
 producerLoop :: ChanMode -> SampleQueue -> MVar (Sink e) -> Sink e -> IO ()
 producerLoop cm sampQ replacementSinkMV sink = do
-    !sinkToPlayNow <- tryTakeMVarWithDefault replacementSinkMV sink
-    let !node = _destNode sinkToPlayNow
-    let !r@(t, d, e) = _sigEnv sinkToPlayNow
+    !(MkSink { destNode = destNode, sigEnv = sigEnv }) <- tryTakeMVarWithDefault replacementSinkMV sink
+    let !node = destNode
+    let !r@(MkSigEnv { t = t, d = d }) = sigEnv
     !(MkS2 x nextNode) <- runNode r node
     -- TODO we can do something with this e. like get outside info, MIDI messages, etc
-    let !nextSink = MkSink { _destNode = nextNode, _sigEnv = (t + d, d, e) }
+    let !nextSink = MkSink { destNode = nextNode, sigEnv = r { t = t + d, d = d } }
     case cm of
       Stereo -> withLR x $ \(!xl) (!xr) -> pushSPSC xl sampQ *> pushSPSC xr sampQ
       Mono -> pushSPSC (hsumLR x `div` 4) sampQ   -- todo properly rescale this

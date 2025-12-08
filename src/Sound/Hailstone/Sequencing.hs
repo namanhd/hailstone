@@ -32,12 +32,12 @@ renderCell _ (MkAC freqs ampls sta du pans env) = (nowNode, sta, du)
     nowNode = mkNode4_ (\_ -> MkNow) freqs ampls pans env
 
 -- | assumed to start at 0
-calcDur :: [(a, TimeVal, TimeVal)] -> TimeVal
-calcDur = go 0
-  where
-    go latestEnd [] = latestEnd
-    go latestEnd ((_, sta, du):rest) = let end = sta + du in
-      if end > latestEnd then go end rest else go latestEnd rest
+-- calcDur :: [(a, TimeVal, TimeVal)] -> TimeVal
+-- calcDur = go 0
+--   where
+--     go latestEnd [] = latestEnd
+--     go latestEnd ((_, sta, du):rest) = let end = sta + du in
+--       if end > latestEnd then go end rest else go latestEnd rest
 
 -- | A setting for `retriggerWith` determining whether to cut the cell's envelope when we're
 -- at its duration (which is `EnvelopeCutsAtCellDuration`) or let the envelope finish.
@@ -57,28 +57,30 @@ data RetriggerMode = RetrigMonophonic | RetrigPolyphonic
 --
 -- Useful for when a `Now` needs to indicate a rest, as without this, the instrument is
 -- going to waste time on rendering yet its result will just be all 0 due to zero amplitude.
-guardByLCAmpl :: Num a => Node e a -> Node e Now -> Node e a
-{-# SPECIALIZE guardByLCAmpl :: Node e (LR SynthVal) -> Node e Now -> Node e (LR SynthVal) #-}
-guardByLCAmpl node = mkNode1IO node $ \r lc myNode ->
-  if lc.ampl <= 0 then pure (MkS2 0 myNode) else runNode r myNode
+guardByLCAmpl :: (Num a, Applicative m) => m (Node e a) -> Node e Now -> m (Node e a)
+{-# SPECIALIZE guardByLCAmpl :: Applicative m => m (Node e (LR SynthVal)) -> Node e Now -> m (Node e (LR SynthVal)) #-}
+guardByLCAmpl mNode nowNode = mNode <&> (\node -> flip (mkNode1IO node) nowNode $ \r lc myNode ->
+  if lc.ampl <= 0 then pure (MkS2 0 myNode) else runNode r myNode)
 
 -- | Play lists of `Cell`s with synths (a node parameterized by nodes of `Now` values).
 -- \"Resets and retriggers\" the instrument in sync with note data.
-retriggerWith :: EnvelopeCellDurationMode
+retriggerWith :: (MonadHasSharing m)
+              => EnvelopeCellDurationMode
               -> RetriggerMode -- ^monophonic or polyphonic triggering
               -> TimeVal -- ^a start time for this retriggering sequence
               -> LR SynthVal -- ^empty value for when notes have concluded
-              -> [([Cell e], (Node e Now -> Node e (LR SynthVal)))]
+              -> [([Cell e], (Node e Now -> m (Node e (LR SynthVal))))]
               -- ^list of parts, each one a (cell list, instrument for this part).
               -- An instrument is parameterized by a node of `Now`s.
-              -> Node e (LR SynthVal)
+              -> m (Node e (LR SynthVal))
 retriggerWith envCellDurMode retrigMode t0 empt cellsInstrs = out
   where
-    ~nodesDurs = flip concatMap cellsInstrs $ \(cells, instrument) -> cells <&> \cell -> let
-      (lc', sta, du) = renderCell envCellDurMode cell
-      lc = share lc'
-      node = share $ guardByLCAmpl (instrument lc) lc
-      in (node, sta, du)
+    ~mNodesDurs = sequenceA $ flip concatMap cellsInstrs $ 
+      \(cells, instrument) -> cells <&> \cell -> do
+        let (lc', sta, du) = renderCell envCellDurMode cell
+        lc <- share lc'
+        node <- share =<< guardByLCAmpl (instrument lc) lc
+        pure (node, sta, du)
     out = case retrigMode of
-      RetrigMonophonic -> piecewiseMono t0 empt $ sortOn (\(_, sta, _) -> sta) nodesDurs
-      RetrigPolyphonic -> share $ piecewisePoly t0 empt nodesDurs
+      RetrigMonophonic -> piecewiseMono t0 empt <$> sortOn (\(_, sta, _) -> sta) <$> mNodesDurs
+      RetrigPolyphonic -> share =<< piecewisePoly t0 empt <$> mNodesDurs

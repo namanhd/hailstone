@@ -176,11 +176,11 @@ echo delayMs decayMult wetLvl filterQ filterF wetPan input = output
 Of course, `share` is meant for the higher-level EDSL user-facing interface of composing nodes together.
 If one is up for the task of writing new nodes/node functions (such as the library implementer, or an enterprising EDSL user), the better way is to directly write a new node function with this logic in the signal function itself.
 
-For instance, one could define a bespoke "fused" node implementing the `echo` example. Its signal function might use the same value from an argument node for multiple math operations. Inside the signal function is normal pure Haskell code operating on real values, so normal, expected sharing semantics apply. Check out `echo'` in `Sound.Hailstone.Synth.Effects` to see this implementation.
+For instance, one could define a bespoke "fused" node implementing the `echo` example. Its signal function might use the same value from an argument node for multiple math operations. Inside the signal function is normal pure Haskell code operating on real values, so normal, expected sharing semantics apply. Check out `echo'` in `Sound.Hailstone.Synth.Effect` to see this implementation.
 
 
 ## Composition
-See `src/Sound/Hailstone/Sequencing/CellScoreBuild.hs` for a prototype DSL for stateful sequencing.
+See `src/Sound/Hailstone/Sequencing/CellScript.hs` for a prototype DSL for stateful sequencing.
 Writeup TODO.
 
 

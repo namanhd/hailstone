@@ -32,6 +32,7 @@ data Cell e
     , env :: !(Node e Percent)
     }
 
+-- | for debug only!
 instance Show (Cell e) where
-  show (MkC f a s d p e) = "MkC(" ++ show f ++ ", " ++ show a ++ ", " ++ show d ++ ", " ++show p ++ ", "++ show e ++ ")"
+  show (MkC f a s d p e) = "MkC(" ++ show f ++ ", " ++ show a ++ ", " ++ show s ++ ", " ++ show d ++ ", " ++show p ++ ", "++ show e ++ ")"
   show (MkAC {}) = "MkAC <cannot show>"

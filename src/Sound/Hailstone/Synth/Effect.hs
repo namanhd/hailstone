@@ -3,7 +3,7 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
-module Sound.Hailstone.Synth.Effects
+module Sound.Hailstone.Synth.Effect
 ( -- * Effects
   gain2ampl
 , gain, gainN
@@ -15,6 +15,8 @@ module Sound.Hailstone.Synth.Effects
 where
 
 import Prelude hiding (isNaN)
+import Data.Functor ((<&>))
+import Control.Monad.IO.Class (liftIO, MonadIO)
 import Sound.Hailstone.Synth.Node
 import qualified Sound.Hailstone.Synth.DelayQueue as DelayQueue
 
@@ -92,20 +94,19 @@ _cookbookFilter_nanCoeffs = MkCFCoeffs nan nan nan nan nan nan
 _cookbookFilter_zeroState :: CookbookFilterState
 _cookbookFilter_zeroState = MkCFState 0 0 0 0 0 0
 
-_cookbookFilter_s0 :: SPair CookbookFilterCoeffs CookbookFilterState
-_cookbookFilter_s0 = MkS2 _cookbookFilter_nanCoeffs _cookbookFilter_zeroState
+_cookbookFilter_s0 :: CookbookFilterState
+_cookbookFilter_s0 = _cookbookFilter_zeroState
 
 _cookbookFilterN_s0 :: STriple Freq CookbookFilterCoeffs CookbookFilterState
 _cookbookFilterN_s0 = MkS3 nan _cookbookFilter_nanCoeffs _cookbookFilter_zeroState
 
-_cookbookFilter_SF :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> SigEnv e -> LR SynthVal -> SPair CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (SPair CookbookFilterCoeffs CookbookFilterState)
-_cookbookFilter_SF coeffsFn q f (_, d, _) x (MkS2 savedCoeffs savedState) = let
-  c = if isNaN savedCoeffs.a0inv then coeffsFn d q f else savedCoeffs
+_cookbookFilter_SF :: CookbookFilterCoeffs -> SigEnv e -> LR SynthVal -> CookbookFilterState -> SPair (LR SynthVal) CookbookFilterState
+_cookbookFilter_SF c _ x savedState = let
   s = _cookbookFilter_fn c savedState x
-  in MkS2 s.ym0 (MkS2 c s)
+  in MkS2 s.ym0 s
 
-_cookbookFilterN_SF :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> SigEnv e -> Freq -> LR SynthVal -> STriple Freq CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (STriple Freq CookbookFilterCoeffs CookbookFilterState)
-_cookbookFilterN_SF coeffsFn q (_, d, _) thisFreq x (MkS3 lastFreq savedCoeffs savedState) = let
+_cookbookFilterN_SF :: TimeVal -> (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> SigEnv e -> Freq -> LR SynthVal -> STriple Freq CookbookFilterCoeffs CookbookFilterState -> SPair (LR SynthVal) (STriple Freq CookbookFilterCoeffs CookbookFilterState)
+_cookbookFilterN_SF d coeffsFn q _ thisFreq x (MkS3 lastFreq savedCoeffs savedState) = let
   c = if thisFreq == lastFreq then savedCoeffs else coeffsFn d q thisFreq
   s = _cookbookFilter_fn c savedState x
   in MkS2 s.ym0 (MkS3 thisFreq c s)
@@ -128,19 +129,19 @@ cookbookCoeffsFn_LPF d q f = let
 
 -- | RBJ 2nd-order filter. <https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html>
 -- Takes a coefficients-calculating function (which itself takes delta time, Q, frequency.)
-cookbookFilter :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-cookbookFilter coeffsFn q f = mkNode1 _cookbookFilter_s0 (_cookbookFilter_SF coeffsFn q f)
+cookbookFilter :: MonadHasDeltaTime m => (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+cookbookFilter coeffsFn q f input = askDeltaTime <&> \d -> mkNode1 _cookbookFilter_s0 (_cookbookFilter_SF (coeffsFn d q f)) input
 
 -- | `cookbookFilter` but with variable filter frequency from a node.
-cookbookFilterN :: (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Node e Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-cookbookFilterN coeffsFn q = MkNode2 _cookbookFilterN_s0 (_cookbookFilterN_SF coeffsFn q)
+cookbookFilterN :: MonadHasDeltaTime m => (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Node e Freq -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+cookbookFilterN coeffsFn q fNode input = askDeltaTime <&> \d -> MkNode2 _cookbookFilterN_s0 (_cookbookFilterN_SF d coeffsFn q) fNode input
 
 -- | 2nd-order low-pass filter.
-lpf :: SynthVal -> Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+lpf :: MonadHasDeltaTime m => SynthVal -> Freq -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
 lpf = cookbookFilter cookbookCoeffsFn_LPF
 
 -- | `lpf` but with variable filter frequency.
-lpfN :: SynthVal -> Node e Freq -> Node e (LR SynthVal) -> Node e (LR SynthVal)
+lpfN :: MonadHasDeltaTime m => SynthVal -> Node e Freq -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
 lpfN = cookbookFilterN cookbookCoeffsFn_LPF
 
 -- *** Delay, echo
@@ -149,29 +150,35 @@ lpfN = cookbookFilterN cookbookCoeffsFn_LPF
 -- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
 --
 -- (More efficient, fused implementation of `echo`.)
-echo' :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-echo' delayMs decayMult wetLvl filterQ filterF wetPan = let delaySec = delayMs * 0.001; dryLvl = max 0 (1 - wetLvl)
-  in mkNode1IO (MkS2 DelayQueue.delay_s0 _cookbookFilter_s0) $ \r@(_, d, _) x (MkS2 myDQ filterState) ->
-    DelayQueue.withDelay delaySec decayMult d myDQ x $ \dq delayOut _ -> let
-      (MkS2 filteredDelayOut filterState') = _cookbookFilter_SF
-        cookbookCoeffsFn_LPF filterQ filterF r delayOut filterState
-      in pure $ MkS2 ((dryLvl .*: x) + balanceLR wetPan (wetLvl .*: filteredDelayOut))
-        (MkS2 dq filterState')
+echo' :: (MonadHasDeltaTime m, MonadIO m) => TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+echo' delayMs decayMult wetLvl filterQ filterF wetPan input = do
+  d <- askDeltaTime
+  let delaySec = delayMs * 0.001
+      dryLvl = max 0 (1 - wetLvl)
+      filterCoeffs = cookbookCoeffsFn_LPF d filterQ filterF
+  dq0 <- liftIO $ DelayQueue.initDQ delaySec d zeroLR
+  pure $ flip (mkNode1IO (MkS2 dq0 _cookbookFilter_s0)) input $ \r x (MkS2 myDQ filterState) ->
+    DelayQueue.withDelay decayMult myDQ x $ \dq delayOut _ -> let
+      (MkS2 filteredDelayOut filterState') = _cookbookFilter_SF filterCoeffs r delayOut filterState
+      in pure $ MkS2 ((dryLvl .*: x) + balanceLR wetPan (wetLvl .*: filteredDelayOut)) (MkS2 dq filterState')
 
 -- | Single-stream echo with constant delay time and decay multiplier. This produces the raw
 -- echo wet signal; do your own mixing and filtering afterwards (or use `echo`.)
-echoRaw :: TimeVal -> Ampl -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-echoRaw delayMs decayMult = let delaySec = delayMs * 0.001
-  in mkNode1IO DelayQueue.delay_s0 $ \(_, d, _) x myDQ ->
-    DelayQueue.withDelay delaySec decayMult d myDQ x $ \dq delayOut _ -> pure $ MkS2 delayOut dq
+echoRaw :: (MonadHasDeltaTime m, MonadIO m) => TimeVal -> Ampl -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+echoRaw delayMs decayMult input = do
+  let delaySec = delayMs * 0.001
+  d <- askDeltaTime
+  dq0 <- liftIO $ DelayQueue.initDQ delaySec d zeroLR
+  pure $ flip (mkNode1IO dq0) input $ \_ x myDQ ->
+    DelayQueue.withDelay decayMult myDQ x $ \dq delayOut _ -> pure $ MkS2 delayOut dq
 
 -- | Single-stream echo with constant delay time, decay multiplier, wet mix level (0-1), low
 -- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
 --
 -- Less efficient but more readable and extensible implementation of `echo'`.
-echo :: TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-echo delayMs decayMult wetLvl filterQ filterF wetPan input = output
-  where
-    input' = share input
-    filteredDelayOut = lpf filterQ filterF $ echoRaw delayMs decayMult input'
-    output = (1 - wetLvl) *|| input' + (balance wetPan $ wetLvl *|| filteredDelayOut)
+echo :: (MonadHasDeltaTime m, MonadHasSharing m, MonadIO m) => TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+echo delayMs decayMult wetLvl filterQ filterF wetPan input = do
+  input' <- share input
+  filteredDelayOut <- lpf filterQ filterF =<< echoRaw delayMs decayMult input'
+  let output = (1 - wetLvl) *|| input' + (balance wetPan $ wetLvl *|| filteredDelayOut)
+  pure output

@@ -21,7 +21,6 @@ module Sound.Hailstone.Synth.MiscTypes
 ) where
 
 import Data.Int (Int16)
-import Sound.Hailstone.Synth.LR
 import Sound.Hailstone.Synth.SynthVal
 
 -- | Channel mode.

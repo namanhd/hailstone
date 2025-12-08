@@ -5,6 +5,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE NoFieldSelectors #-}
 
 -- for HasField passthrough
 {-# LANGUAGE UndecidableInstances #-}
@@ -25,18 +26,18 @@ module Sound.Hailstone.Synth.Node
   -- The audio node /tree/ can become an audio node /graph/ (a DAG, to be specific) with the
   -- use of `share`, which uses sorcery to enable /observable sharing/, letting the embedded
   -- DSL see the sharing semantics, the let-bindings & usage of names, of the host language.
-  -- 
+  --
   -- This module contains the definition of the `Node` type, its instances, and a prelude of
-  -- basic functions creating and operating on `Node`s. 
-  -- See "Sound.Hailstone.Synth.Generators" for generator nodes (oscillators), and
-  -- "Sound.Hailstone.Synth.Effects" for effect nodes.
-  Node(..), SigEnv
+  -- basic functions creating and operating on `Node`s.
+  -- See "Sound.Hailstone.Synth.Generator" for generator nodes (oscillators), and
+  -- "Sound.Hailstone.Synth.Effect" for effect nodes.
+  Node(..), SigEnv(..)
   -- *** Convenient derived constructors
-, mkNode1, mkNode1IO, mkNode3, mkNode4_
+, mkNode1, mkNode1IO, mkNode3, mkNode4, mkNode4_
   -- ** Observable sharing
 , share
   -- ** Consuming nodes at the audio backend
-, Sink(..), initSink, runNode, iterateNode
+, Sink(..), buildSink, runNode, iterateNode
   -- ** Basic operators
 , (|+|), (|*|), (+|), (+||), (*|), (*||), accum, tick
   -- ** Numeric and stereo conversions
@@ -47,6 +48,7 @@ module Sound.Hailstone.Synth.Node
 , adsr', adsr'N, adsr
 , funcRamp, linearRamp
   -- * Re-exports
+, module Sound.Hailstone.Synth.NodeDefnCtx
 , module Sound.Hailstone.Synth.SynthVal
 , module Sound.Hailstone.Synth.LR
 , module Sound.Hailstone.Synth.MiscTypes
@@ -60,11 +62,9 @@ import Data.Functor ((<&>))
 import Sound.Hailstone.Synth.SynthVal
 import Sound.Hailstone.Synth.LR
 import Sound.Hailstone.Synth.MiscTypes
+import Sound.Hailstone.Synth.NodeDefnCtx
 import qualified Sound.Hailstone.VoiceAlloc as VoiceAlloc
-
--- dark magic for observable sharing
-import System.IO.Unsafe (unsafePerformIO)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (readIORef, writeIORef)
 
 -- for HasField passthrough
 import GHC.Records
@@ -72,7 +72,12 @@ import GHC.Records
 -- | A signal function needs access to the current time and the time delta between samplings
 -- (i.e. 1 / (samplerate)). We also take an external environment type @e@ along for the ride
 -- for other outside-world information (loaded waveform/sample buffers, MIDI messages, etc.)
-type SigEnv e = (TimeVal, TimeVal, e)
+data SigEnv e
+  = MkSigEnv
+  { t :: TimeVal
+  , d :: TimeVal
+  , e :: e
+  }
 
 --------------------------------------------------------------------------------
 -- * Audio nodes
@@ -111,14 +116,16 @@ There are a number of design decisions here...
   possible to represent audio node graphs i.e. forking a node output to feed multiple nodes?
 
     - A: With some cursed magic to implement __observable sharing__ in `share`, yes. That is
-      the general way to hijack the host language's sharing and make it manifest in the EDSL
-      embedded within it, without having to make the DSL type a monad (which we don't have).
+      the general way to hijack the host language's sharing to make it manifest in the EDSL.
 
-- Q: Why are there separate stateless variants of `MkNode0` and `MkNode2`?
+- Q: Why are there separate stateless and IO variants of `MkNode0` and `MkNode2`?
 
     - A: We can model `MkNode0_` and `MkNode2_` with the stateful counterparts, but this has
-      some cost (the dummy state @()@ being created or passed around for function calls). As
-      we're trying to be as efficient as possible, we specialize as much as possible.
+      some cost (the dummy state @()@ being created or passed around for function calls). We
+      try to be as efficient as possible, so we specialize as much as possible. We need `IO`
+      for nodes that work with unboxed buffers (such as delays); while we could do this with
+      `ST` monad behind the scenes and expose pure immutable arrays, this results in massive
+      ballooning of allocations (2 times as much) and too much GC pressure.
 -}
 data Node e x where
   MkNodeConst :: !x -> Node e x
@@ -220,6 +227,12 @@ mkNode3 :: s -> (SigEnv e -> a -> b -> c -> s -> SPair x s) -> Node e a -> Node 
 mkNode3 s sig ~aNode ~bNode = MkNode2 s (\r (MkS2 a b) -> sig r a b) (liftA2 MkS2 aNode bNode)
 {-# INLINABLE mkNode3 #-}
 
+-- | Constructor for a stateful 4-ary node.
+mkNode4 :: s -> (SigEnv e -> a -> b -> c -> d -> s -> SPair x s) -> Node e a -> Node e b -> Node e c -> Node e d -> Node e x
+mkNode4 s sig ~aNode ~bNode ~cNode ~dNode = MkNode2 s (\r (MkS2 a b) (MkS2 c d) s' -> sig r a b c d s')
+  (liftA2 MkS2 aNode bNode) (liftA2 MkS2 cNode dNode)
+{-# INLINABLE mkNode4 #-}
+
 -- | Constructor for a stateless 4-ary node.
 mkNode4_ :: (SigEnv e -> a -> b -> c -> d -> x) -> Node e a -> Node e b -> Node e c -> Node e d -> Node e x
 mkNode4_ sig ~aNode ~bNode ~cNode ~dNode = MkNode2_ (\r (MkS2 a b) (MkS2 c d) -> sig r a b c d)
@@ -231,7 +244,7 @@ mkNode4_ sig ~aNode ~bNode ~cNode ~dNode = MkNode2_ (\r (MkS2 a b) (MkS2 c d) ->
 
 data OshCache a = MkOshCached {-# UNPACK #-} !TimeVal !a | MkOshNothing
 
--- | Uses `unsafePerformIO` to allow a node to cache its output, keyed by current time. If a
+-- | Uses mutable references to allow a node to cache its output keyed by current time. If a
 -- cache-supporting node is run with a new @t@ /different/ from the @t@ of the current cache
 -- value, the cache is cleared & refreshed with a value computed from the signal function.
 --
@@ -249,18 +262,19 @@ data OshCache a = MkOshCached {-# UNPACK #-} !TimeVal !a | MkOshNothing
 -- do not get reset by this change, then we might run into wrong states being used. Also any
 -- printing of node tree states will yield the wrong states for these always-shadowed nodes.
 --
--- CAVEAT: this has a bit of overhead (`unsafePerformIO` and the `IORef` both incur a cost),
--- though it will be beneficial for most nontrivial nodes and especially ones that are piped
--- into many other nodes as arguments. Do profiling to inform judgment of whether `share` is
--- helping or not, because it can be non-obvious.
+-- CAVEAT: this has a bit of overhead, though it will be beneficial for nontrivial nodes and
+-- and especially ones that are piped into many other nodes as arguments. Profile to tell if
+-- `share` is helping or not, because it can be non-obvious.
 --
 -- See [reactive-banana's writeup](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/doc/design/design.md)
 -- and [implementation](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/src/Reactive/Banana/Prim/High/Cached.hs)
--- of this approach (observable sharing had been described in papers prior.)
-share :: Node e x -> Node e x
-share me@(MkNodeConst _) = me
-share ~node = unsafePerformIO $ newIORef MkOshNothing <&> \ref -> MkNode0IO Nothing $
-  \r@(!t, _, _) ~maybeMyNode -> readIORef ref >>= \case
+-- of this approach (observable sharing had been described in papers prior.) These papers do
+-- this via `unsafePerformIO`; the monad here is just `IO` to avoid the unsafe call but I've
+-- abstracted it out to an interface with only `newShareRef` to isolate it from general IO.
+share :: MonadHasSharing m => Node e x -> m (Node e x)
+share me@(MkNodeConst _) = pure me
+share ~node = newShareRef MkOshNothing <&> \ref -> MkNode0IO Nothing $
+  \r@(MkSigEnv { t = !t }) ~maybeMyNode -> readIORef ref >>= \case
     -- on cache miss, run (either the original node or our saved current version of it) then
     -- cache the result, then return it, and save (Just new_node) as our new saved state. If
     -- the cache hits, then the cache ALWAYS hits, because we come after the 1st instance of
@@ -270,7 +284,6 @@ share ~node = unsafePerformIO $ newIORef MkOshNothing <&> \ref -> MkNode0IO Noth
     (MkOshCached tc xc) | tc == t -> pure (MkS2 xc maybeMyNode)
     _ -> runNode r (maybe node id maybeMyNode) >>= \(MkS2 x new_node) ->
       writeIORef ref (MkOshCached t x) *> pure (MkS2 x (Just new_node))
-{-# NOINLINE share #-}
 
 --------------------------------------------------------------------------------
 -- ** Consuming nodes at the audio backend
@@ -313,18 +326,13 @@ iterateNode r stepper n node = if n <= 0 then pure $ MkS2 [] node else do
   pure $ MkS2 (x : xs) nodeFinal
 
 -- | A convenience state type for an audio backend to save. The audio backend is responsible
--- for consuming @_destNode@ and stepping/updating the @_sigEnv@ (to new time values.)
-data Sink e =
-  MkSink  { _destNode :: !(Node e (LR SampleVal))
-          , _sigEnv :: !(TimeVal, TimeVal, e)
-          }
+-- for consuming @destNode@ and updating the @sigEnv@ to new time values.
+data Sink e = MkSink { destNode :: !(Node e (LR SampleVal)), sigEnv :: !(SigEnv e) }
 
--- | Initializing a `Sink` with a pure zero `Node`.
-initSink :: SampleRate -> e -> Sink e
-initSink sampleRate e =
-  MkSink  { _destNode = pure zeroLR
-          , _sigEnv = (0.0, recip $ fromIntegral sampleRate, e)
-          }
+-- | Run the node definition context monad to get the node and build a `Sink` for playback.
+buildSink :: SampleRate -> e -> NodeDefnCtx (Node e (LR SampleVal)) -> IO (Sink e)
+buildSink sampleRate e (MkNodeDefnCtx runit) = let d = recip $ fromIntegral sampleRate
+  in runit d <&> \node -> MkSink { destNode = node, sigEnv = MkSigEnv { t = 0.0, d = d, e = e } }
 
 --------------------------------------------------------------------------------
 -- ** Basic operators
@@ -350,7 +358,7 @@ tick sta = mkNode1 sta $ \_ i s -> MkS2 s (s + i)
 
 -- | Retrieve the time tick context from the signal environment, as a node.
 nTime :: Node e TimeVal
-nTime = MkNode0_ $ \(!t, _, _) -> t
+nTime = MkNode0_ (.t)
 {-# INLINABLE nTime #-}
 
 -- | Mix two nodes with addition.
@@ -417,13 +425,13 @@ modifyTime f df node = case node of
   (MkNode2IO s sig aNode bNode) -> MkNode2IO s (sfgo sig) (modifyTime f df aNode) (modifyTime f df bNode)
   where
     sfgo :: (SigEnv e -> a) -> SigEnv e -> a
-    sfgo sig (!t, d, e) = sig (f t, df d, e)
+    sfgo sig r@(MkSigEnv { t = !t, d = d }) = sig (r { t = f t, d = df d })
 
 -- | Have a node start emitting at a start time (and possibly end after some duration), else
 -- emitting a default empty value outside the allowed timespan.
 startWithDurAndEmpty :: a -> TimeVal -> TimeVal -> Node e a -> Node e a
 startWithDurAndEmpty empt sta du ~node' = let s = modifyTime (subtract sta) id node'
-  in MkNode0IO s $ \r@(!t, _, _) node -> if
+  in MkNode0IO s $ \r@(MkSigEnv { t = !t }) node -> if
     | t < sta -> pure $ MkS2 empt node
     | t < (sta + du) -> runNode r node
     | otherwise -> pure $ MkS2 empt node
@@ -478,12 +486,12 @@ monosum = fmap hsumLR
 {-# INLINABLE monosum #-}
 
 -- | Lift a function on mono nodes to become a function on stereo nodes
-mapLRNode :: (Node e SynthVal -> Node e SynthVal) -> Node e (LR SynthVal) -> Node e (LR SynthVal)
-mapLRNode f lrNode = let
-  lrNode' = share lrNode
-  lNode = f $ fmap (\lr -> withLR lr $ \l _ -> l) lrNode'
-  rNode = f $ fmap (\lr -> withLR lr $ \_ r -> r) lrNode'
-  in liftA2 mkLR lNode rNode
+mapLRNode :: MonadHasSharing m => (Node e SynthVal -> Node e SynthVal) -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+mapLRNode f lrNode = do
+  lrNode' <- share lrNode
+  let lNode = f $ fmap (\lr -> withLR lr $ \l _ -> l) lrNode'
+      rNode = f $ fmap (\lr -> withLR lr $ \_ r -> r) lrNode'
+  pure $ liftA2 mkLR lNode rNode
 
 -- halfpi :: SynthVal
 -- halfpi = 0.5 * pi
@@ -525,10 +533,10 @@ piecewiseMono t0 empt nodesDurs = out
   -- the state function for the node. check the start time of the next node and switch to it
   -- and consume one node from the list if its time is here, otherwise just keep playing the
   -- current node
-  gogo r@(t, _, _) (currNode, !currStart, !currDur, nil@[]) = do
+  gogo r@(MkSigEnv { t = t }) (currNode, !currStart, !currDur, nil@[]) = do
     (MkS2 x new_currNode) <- if t < currStart + currDur then runNode r currNode else pure $ MkS2 empt currNode
     pure $ MkS2 x (new_currNode, currStart, currDur, nil)
-  gogo r@(t, _, _) s@(currNode, currStart, currDur, ls@((nextNode, !nextStart, nextDur):rest))
+  gogo r@(MkSigEnv { t = t }) s@(currNode, currStart, currDur, ls@((nextNode, !nextStart, nextDur):rest))
     | t < currStart = pure $ MkS2 empt s
     | t < nextStart = runNode r currNode <&> \(MkS2 x new_currNode) -> MkS2 x (new_currNode, currStart, currDur, ls)
     | otherwise = nextStart `seq` nextDur `seq` rest `seq`
@@ -592,13 +600,13 @@ adsr' (ADSR tA tD tS tR v0 v1 v2) = let
   t0R = t0S + tS
   dR = (v2 - v1) / tR
   tEnd = t0R + tR
-  sig (!t, _, _)
+  sig (MkSigEnv { t = !t })
     | t < tA = v0 + t * dA
     | t < t0S = 1.0 + (t - tA) * dD
     | t < t0R = v1
     | t < tEnd = v1 + (t - t0R) * dR
     | otherwise = v2
-  in share $ MkNode0_ sig
+  in MkNode0_ sig
 
 -- | Convenience shorthand for `adsr'` on an `ADSR` literal.
 adsr :: TimeVal -> TimeVal -> TimeVal -> TimeVal -> Percent -> Percent -> Percent -> Node e Percent
@@ -611,7 +619,7 @@ adsr tA tD tS tR v0 v1 v2 = adsr' $ ADSR tA tD tS tR v0 v1 v2
 -- using the latest received ADSR parameters.
 adsr'N :: Node e ADSRParams -> Node e Percent
 adsr'N = mkNode1 (MkS2 nan Nothing) $
-  \(!t, d, _) (ADSR tA tD tS tR v0 v1 v2) (MkS2 x' precalcs') -> let
+  \(MkSigEnv { t = !t, d = d }) (ADSR tA tD tS tR v0 v1 v2) (MkS2 x' precalcs') -> let
     -- using NaN as a (Nothing :: Maybe Double) to not have to waste resources on Just unbox
     -- but this won't generalize to all choices of SynthVal...  but realistically it's fine?
     x = if isNaN x' then v0 else x'

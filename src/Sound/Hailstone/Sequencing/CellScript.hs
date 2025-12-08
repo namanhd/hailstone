@@ -1,28 +1,30 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE BangPatterns #-}
 
-module Sound.Hailstone.Sequencing.CellScoreBuild
-( CellScoreBuild
-  -- ** commands
+module Sound.Hailstone.Sequencing.CellScript
+( CellScript
+  -- ** Commands
 , add, set, with, with', block, block', use, use', visit, visit', here, rep
-  -- ** instrument commands
+  -- ** Instrument commands
 , withInstr, setInstr
-  -- ** setter prefixes
+  -- ** Setter prefixes
 , go, at, priv, andThen
-  -- ** setters
+  -- ** Setters
 , freq, itvl, ampA, ampX, gain, jump, step, durA, durX, panA, panX, envl, susX, cell
-  -- ** compilation
-, realizeCellScore
+  -- ** Compilation
+, realizeCellScript
 )
 where
 
 import qualified Data.Text as T
 import Control.Monad.State.Strict
 import qualified Data.Map.Strict as M
+
 import Sound.Hailstone.Sequencing.Cell
 import Sound.Hailstone.Sequencing.Now (Now)
 import Sound.Hailstone.Synth.Node (adsr', Node, (*|), LR)
-import Sound.Hailstone.Synth.Effects (gain2ampl)
+import Sound.Hailstone.Synth.Effect (gain2ampl)
 import Sound.Hailstone.Synth.SynthVal
 import Sound.Hailstone.Synth.MiscTypes (ADSRParams(..), SPair(..), STriple(..))
 
@@ -30,20 +32,20 @@ type InstrumentSymbol = T.Text
 
 type CellScore e = M.Map InstrumentSymbol [Cell e]
 
---- TODO add to the state a "max instrument id" and some actionsin this monad to register a new instrument
-type CellScoreBuild e a = State (STriple (Cell e) InstrumentSymbol (CellScore e)) a
+-- | An embedded DSL for writing a score (lists of `Cell`s and their instruments.)
+type CellScript e a = State (STriple (Cell e) InstrumentSymbol (CellScore e)) a
 
-_csbPutAndMakeState :: Cell e -> Cell e -> InstrumentSymbol -> CellScore e -> STriple (Cell e) InstrumentSymbol (CellScore e)
-_csbPutAndMakeState addCell putCell inst score = MkS3 putCell inst $
+_csPutAndMakeState :: Cell e -> Cell e -> InstrumentSymbol -> CellScore e -> STriple (Cell e) InstrumentSymbol (CellScore e)
+_csPutAndMakeState addCell putCell inst score = MkS3 putCell inst $
   M.insert inst (addCell : (maybe [] id $ M.lookup inst score)) score
 
 -- | add a cell (both add it to the score and return it) and put a cell in the state
-_csbAddRetPut :: Cell e -> Cell e -> Cell e -> CellScoreBuild e (Cell e)
-_csbAddRetPut addCell retCell putCell = (retCell <$) $ modify $ \(MkS3 _ inst score) -> _csbPutAndMakeState addCell putCell inst score
+_csAddRetPut :: Cell e -> Cell e -> Cell e -> CellScript e (Cell e)
+_csAddRetPut addCell retCell putCell = state $ \(MkS3 _ inst score) -> (retCell, _csPutAndMakeState addCell putCell inst score)
 
 -- | don't add anything to the score, just put a cell in the state and return it
-_csbRetPutThisOnly :: Cell e -> CellScoreBuild e (Cell e)
-_csbRetPutThisOnly putCell = (putCell <$) $ modify $ \(MkS3 _ inst score) -> MkS3 putCell inst score
+_csRetPutThisOnly :: Cell e -> CellScript e (Cell e)
+_csRetPutThisOnly putCell = state $ \(MkS3 _ inst score) -> (putCell, MkS3 putCell inst score)
 
 data CellSetterActMode
   = At  -- ^ apply the setter to the cell being added-and-returned only, not the current cell in the state
@@ -65,20 +67,20 @@ type CellAct e = SPair CellSetterActMode (CellMod e)
 --------------------------------------------------------------------------------
 -- ** commands
 
--- | Construct a score with a given starting instrument; afterwards return to the instrument
+-- | Run a cellscript with a given starting instrument; afterwards return to the instrument
 -- in the state from before this command.
-withInstr :: InstrumentSymbol -> CellScoreBuild e (Cell e) -> CellScoreBuild e (Cell e)
-withInstr inst csb = state $ \(MkS3 stateCell origInst score) -> let
-  (ret, (MkS3 stateCell' _ score')) = runState csb (MkS3 stateCell inst score)
+withInstr :: InstrumentSymbol -> CellScript e (Cell e) -> CellScript e (Cell e)
+withInstr inst cs = state $ \(MkS3 stateCell origInst score) -> let
+  (ret, (MkS3 stateCell' _ score')) = runState cs (MkS3 stateCell inst score)
   in (ret, MkS3 stateCell' origInst score')
 
 -- | Switch to a new current instrument.
-setInstr :: InstrumentSymbol -> CellScoreBuild e (Cell e)
+setInstr :: InstrumentSymbol -> CellScript e (Cell e)
 setInstr inst = state $ \(MkS3 stateCell _ score) -> (stateCell, MkS3 stateCell inst score)
 
 -- | processes lists of acts given the cell-to-add, cell-to-return, and cell-to-put-in-the-state
 _gogo :: Cell e -> Cell e -> Cell e -> [CellAct e] -> (Cell e -> Cell e -> Cell e -> x) -> x
-_gogo addCell retCell putCell acts k = case acts of
+_gogo !addCell !retCell !putCell acts k = case acts of
   [] -> k addCell retCell putCell
   ((MkS2 mode f):as) -> case mode of
     Priv -> _gogo (f addCell) retCell     putCell     as k
@@ -87,68 +89,68 @@ _gogo addCell retCell putCell acts k = case acts of
     Then -> _gogo addCell     retCell     (f putCell) as k
 
 -- | Return the state cell at this point.
-here :: CellScoreBuild e (Cell e)
-here = get >>= \(MkS3 stateCell _ _) -> pure stateCell
+here :: CellScript e (Cell e)
+here = (\(MkS3 stateCell _ _) -> stateCell) <$> get
 
 -- | Add and return the state cell after doing some actions to it.
-add :: [CellAct e] -> CellScoreBuild e (Cell e)
-add acts' = get >>= \(MkS3 stateCell _ _) -> _gogo stateCell stateCell stateCell acts' _csbAddRetPut
+add :: [CellAct e] -> CellScript e (Cell e)
+add acts' = get >>= \(MkS3 stateCell _ _) -> _gogo stateCell stateCell stateCell acts' _csAddRetPut
 
 -- | Set properties of the state cell with some setters.
-set :: [CellMod e] -> CellScoreBuild e (Cell e)
+set :: [CellMod e] -> CellScript e (Cell e)
 set fs = get >>= \(MkS3 stateCell _ _) -> _gogo stateCell stateCell stateCell
-  (map (MkS2 Go) fs) (\_ _ -> _csbRetPutThisOnly)
+  (map (MkS2 Go) fs) (\_ _ -> _csRetPutThisOnly)
 
-with_ :: Bool -> [CellMod e] -> CellScoreBuild e (Cell e) -> CellScoreBuild e (Cell e)
-with_ keepNewTime fs csb = state $ \(MkS3 stateCell inst score) -> let
+with_ :: Bool -> [CellMod e] -> CellScript e (Cell e) -> CellScript e (Cell e)
+with_ keepNewTime fs cs = state $ \(MkS3 stateCell inst score) -> let
   putCell' = _gogo stateCell stateCell stateCell (map (MkS2 Go) fs) (\_ _ pc -> pc)
-  (ret, MkS3 stateCell' _ score') = runState csb (MkS3 putCell' inst score)
+  (ret, MkS3 stateCell' _ score') = runState cs (MkS3 putCell' inst score)
   stateCell'' = if keepNewTime then stateCell { start = stateCell'.start } else stateCell
   in (ret, MkS3 stateCell'' inst score')
 
 -- | Use a given cell with some actions applied as the starting cell state to run a score of
 -- commands, then restore the last state from before this command afterwards (except for the
 -- start time, which is the resulting time from the block.)
-with :: [CellMod e] -> CellScoreBuild e (Cell e) -> CellScoreBuild e (Cell e)
+with :: [CellMod e] -> CellScript e (Cell e) -> CellScript e (Cell e)
 with = with_ True
 
 -- | Same as `with` but /also/ restoring the start time from before this command.
-with' :: [CellMod e] -> CellScoreBuild e (Cell e) -> CellScoreBuild e (Cell e)
+with' :: [CellMod e] -> CellScript e (Cell e) -> CellScript e (Cell e)
 with' = with_ False
 
 -- | Same as `with` but without any actions applied before running the score.
-block :: CellScoreBuild e (Cell e) -> CellScoreBuild e (Cell e)
+block :: CellScript e (Cell e) -> CellScript e (Cell e)
 block = with []
 
 -- | Same as `with'` but without any actions applied before running the score.
-block' :: CellScoreBuild e (Cell e) -> CellScoreBuild e (Cell e)
+block' :: CellScript e (Cell e) -> CellScript e (Cell e)
 block' = with' []
 
-use_ :: Bool -> Bool -> Cell e -> [CellAct e] -> CellScoreBuild e (Cell e)
+use_ :: Bool -> Bool -> Cell e -> [CellAct e] -> CellScript e (Cell e)
 use_ keepNewTime keepState inputCell acts' = get >>= \(MkS3 stateCell _ _) -> let
   inputCell' = (if keepNewTime then inputCell { start = stateCell.start } else inputCell)
-  in _gogo inputCell' inputCell' (if keepState then stateCell else inputCell') acts' _csbAddRetPut
+  in _gogo inputCell' inputCell' (if keepState then stateCell else inputCell') acts' _csAddRetPut
 
 -- | Add the input cell with some actions applied and set it as the new state. This will not
 -- transfer the start time of the input cell; we use the state's current time instead.
-use :: Cell e -> [CellAct e] -> CellScoreBuild e (Cell e)
+use :: Cell e -> [CellAct e] -> CellScript e (Cell e)
 use = use_ True False
 
 -- | `use` that /does/ transfer the start time of the input cell.
-use' :: Cell e -> [CellAct e] -> CellScoreBuild e (Cell e)
+use' :: Cell e -> [CellAct e] -> CellScript e (Cell e)
 use' = use_ False False
 
 -- | Add the input cell with some actions applied, but don't set it as the new state. Like
 -- `use`, this will not transfer the start time of the input cell.
-visit :: Cell e -> [CellAct e] -> CellScoreBuild e (Cell e)
+visit :: Cell e -> [CellAct e] -> CellScript e (Cell e)
 visit = use_ True True
 
 -- | `visit` that /does/ transfer the start time of the input cell.
-visit' :: Cell e -> [CellAct e] -> CellScoreBuild e (Cell e)
+visit' :: Cell e -> [CellAct e] -> CellScript e (Cell e)
 visit' = use_ False True
 
--- | Repeat a score n times. The score is a function that takes the iteration as argument.
-rep :: Int -> (Int -> CellScoreBuild e a) -> CellScoreBuild e ()
+-- | Repeat a script n times. The score is a function that takes the iteration as argument.
+rep :: Int -> (Int -> CellScript e a) -> CellScript e ()
 rep n f = mapM_ f [0..(n - 1)]
 
 --------------------------------------------------------------------------------
@@ -251,17 +253,17 @@ susX x = ls $ \c -> case c of
   (MkC { adsr = adsr } ) -> c { adsr = adsr { tS = x * adsr.tS } }
   (MkAC {}) -> error "cannot use susX with an articulated cell"
 
--- | \"Compiles\" a `CellScoreBuild` spec into song data playable with `retriggerWith` given
+-- | \"Compiles\" a `CellScript` spec into song data playable with `retriggerWith` given
 -- a starting cell state to interpret the score.
-realizeCellScore  :: InstrumentSymbol -- ^ starting instrument name
+realizeCellScript :: InstrumentSymbol -- ^ starting instrument name
                   -> Cell e  -- ^ starting cell state
-                  -> [(InstrumentSymbol, Node e Now -> Node e (LR SynthVal))]  -- ^ map from instrument name to instrument
-                  -> CellScoreBuild e a  -- ^ the cell score specification
-                  -> [([Cell e], Node e Now -> Node e (LR SynthVal))]
-realizeCellScore startInst startCell instrName2Node csb = let
+                  -> [(InstrumentSymbol, Node e Now -> m (Node e (LR SynthVal)))]  -- ^ map from instrument name to instrument
+                  -> CellScript e a  -- ^ the cell score specification
+                  -> [([Cell e], Node e Now -> m (Node e (LR SynthVal)))]
+realizeCellScript startInst startCell instrName2Node cs = let
   instrName2NodeMap = M.fromList instrName2Node
   s0 = MkS3 startCell startInst M.empty
-  MkS3 _ _ score = execState csb s0
+  MkS3 _ _ score = execState cs s0
   in M.foldlWithKey' (\acc inst cellsThisInst -> case M.lookup inst instrName2NodeMap of
     Just nodeThisInst -> ((cellsThisInst, nodeThisInst) : acc)
     Nothing -> acc {-should probably report this with a message.. -}) [] score

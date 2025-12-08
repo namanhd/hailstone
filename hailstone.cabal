@@ -3,11 +3,11 @@ name:                 hailstone
 version:              0.1.0.0
 synopsis:             audio synthesis + music composition
 homepage:             https://github.com/namanhd/hailstone
-license:              MIT
+license:              BSD-3-Clause
 license-file:         LICENSE
 author:               namanh
 copyright:            2025 namanh
-category:             Sound
+category:             Sound, Music
 build-type:           Simple
 
 flag audio-backend-sdl
@@ -20,20 +20,33 @@ flag audio-backend-sdl
 common ghcflags
   ghc-options: -Wall -O3 -threaded -optc-O3 -fexcess-precision
 
+common audio-backend-deps
+  if flag(audio-backend-sdl)
+    cpp-options:      -DHLSTN_AUDIO_BACKEND_SDL
+    other-modules:    Sound.Hailstone.Backends.SDLAudio
+    build-depends:    sdl2
+                    , vector
+  else
+    other-modules:    Sound.Hailstone.Backends.PortAudio
+    build-depends:    portaudio
+
+
 library
   import:             ghcflags
   hs-source-dirs:     src
   default-language:   Haskell2010
-  exposed-modules:    Sound.Hailstone.Synth.Node
-                    , Sound.Hailstone.Synth.Generators
-                    , Sound.Hailstone.Synth.Effects
+  exposed-modules:    Sound.Hailstone.Synth
+                    , Sound.Hailstone.Synth.Node
+                    , Sound.Hailstone.Synth.Generator
+                    , Sound.Hailstone.Synth.Effect
+                    , Sound.Hailstone.Synth.NodeDefnCtx
                     , Sound.Hailstone.Synth.LR
                     , Sound.Hailstone.Synth.SynthVal
                     , Sound.Hailstone.Synth.DelayQueue
                     , Sound.Hailstone.Synth.MiscTypes
                     , Sound.Hailstone.Sequencing
                     , Sound.Hailstone.Sequencing.Cell
-                    , Sound.Hailstone.Sequencing.CellScoreBuild
+                    , Sound.Hailstone.Sequencing.CellScript
                     , Sound.Hailstone.Sequencing.Now
                     , Sound.Hailstone.VoiceAlloc
   build-depends:      base >= 4.19 && < 5
@@ -44,6 +57,7 @@ library
 
 executable hailstone-scratch
   import:             ghcflags
+                    , audio-backend-deps
   hs-source-dirs:     exe
   main-is:            ScratchMain.hs
   other-modules:      Sound.Hailstone.Backends.Common
@@ -53,11 +67,15 @@ executable hailstone-scratch
                     , hailstone
                     , array
 
-  if flag(audio-backend-sdl)
-    cpp-options:      -DHLSTN_AUDIO_BACKEND_SDL
-    other-modules:    Sound.Hailstone.Backends.SDLAudio
-    build-depends:    sdl2
-                    , vector
-  else
-    other-modules:    Sound.Hailstone.Backends.PortAudio
-    build-depends:    portaudio
+-- executable hailstone
+--   import:             ghcflags
+--                     , audio-backend-deps
+--   hs-source-dirs:     exe
+--   main-is:            EditorMain.hs
+--   other-modules:      Sound.Hailstone.Backends.Common
+--   ghc-options:        -rtsopts -with-rtsopts "-N -maxN2 -H20m"
+--   default-language:   Haskell2010
+--   build-depends:      base >= 4.19 && < 5
+--                     , hailstone
+--                     , array
+--                     , gi-gtk4

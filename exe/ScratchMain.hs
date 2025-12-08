@@ -5,12 +5,10 @@
 -- Test main executable, for trying out songs and synths
 
 module Main where
-import Sound.Hailstone.Synth.Node
-import Sound.Hailstone.Synth.Generators
-import Sound.Hailstone.Synth.Effects
+import Sound.Hailstone.Synth
 import Sound.Hailstone.Sequencing
 import qualified Sound.Hailstone.Sequencing.Cell as C
-import Sound.Hailstone.Sequencing.CellScoreBuild
+import Sound.Hailstone.Sequencing.CellScript
 
 -- the backends are interchangeable
 #ifdef HLSTN_AUDIO_BACKEND_SDL
@@ -133,7 +131,7 @@ testSong3 = let
       topchords 2 (5/3) 17, topchords 2 (5/3) 21, topchords (5/3) (30/16) 25, topchords (4/3) 2 29
     ] )
 
-testSong4csb :: CellScoreBuild e ()
+testSong4csb :: CellScript e ()
 testSong4csb = do
   set $ ampX 0.6
   add $ go itvl (3/2)
@@ -183,15 +181,15 @@ testSong4csb = do
   pure ()
 
 
-testSong4 :: [([Cell e], Node e Now -> Node e (LR SynthVal))]
-testSong4 = realizeCellScore
+testSong4 :: MonadHasSharing m => [([Cell e], Node e Now -> m (Node e (LR SynthVal)))]
+testSong4 = realizeCellScript
   "fmkeys"
   (MkC { C.freq=370, C.ampl=0.8, C.start=0, C.dur=0.135, C.pan=0.5, C.adsr=(ADSR 0.005 0 0.21 0.1 0.5 1.0 0.0)})
   [("fmkeys", testSynth4)]
   testSong4csb
 
-testSynth0 :: Node e Now -> Node e (LR SynthVal)
-testSynth0 now = finalNode
+testSynth0 :: Applicative m => Node e Now -> m (Node e (LR SynthVal))
+testSynth0 now = pure finalNode
   where
     f = now.freq
     a = now.ampl
@@ -199,53 +197,51 @@ testSynth0 now = finalNode
     -- pan = now.pan
     finalNode = mono2stereo $ e * sinOsc a (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
 
-testSynth1 :: Node e Now -> Node e (LR SynthVal)
-testSynth1 now = finalNode
-  where
-    f = share $ now.freq
-    a = now.ampl
-    e = share $ now.env -- note envelope current value
-    -- pan = now.pan
-    sinModulator3 = adsr 0.015 0.0 0.02 0.01 0.5 1.0 1.0 * sinOsc e (5 *| f)
-    fWithVibrato = (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
-    sinCarrier = sinOscPM (0.8 *| a) fWithVibrato sinModulator3
-    finalNode = mono2stereo $ e * sinCarrier
+testSynth1 :: MonadHasSharing m => Node e Now -> m (Node e (LR SynthVal))
+testSynth1 now = do
+  f <- share $ now.freq
+  a <- pure $ now.ampl
+  e <- share $ now.env -- note envelope current value
+  -- pan = now.pan
+  let sinModulator3 = adsr 0.015 0.0 0.02 0.01 0.5 1.0 1.0 * sinOsc e (5 *| f)
+      fWithVibrato = (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
+      sinCarrier = sinOscPM (0.8 *| a) fWithVibrato sinModulator3
+      finalNode = mono2stereo $ e * sinCarrier
+  pure finalNode
 
-testSynth2 :: Node e Now -> Node e (LR SynthVal)
-testSynth2 now = finalNode
-  where
-    f = share $ now.freq
-    a = share $ now.ampl
-    e = share $ now.env -- note envelope current value
-    -- also apply a pitch envelope on top of vibrato
-    fWithVibrato  = share $ adsr 0.01 0.0 0.05 0.01 0.0 1.0 1.0 * (f * (1 +| sinOsc 0.02 5))
-    sinModulator1 = e * adsr 0.04 0.0 0.05 0.01 0.1 1.0 1.0 * triOsc 0.7 (5 *| f)
-    sinCarrier1   = sinOscPM a fWithVibrato sinModulator1
-    sinModulator2 = adsr 0.0 0.0 0.0 0.07 1.0 1.0 0.0 * triOsc 1.2 (7 *| f)
-    sinCarrier2   = sinOscPM a (2 *| fWithVibrato) sinModulator2
-    finalNode     = mono2stereo $ e * (sinCarrier1 + sinCarrier2)
+testSynth2 :: MonadHasSharing m => Node e Now -> m (Node e (LR SynthVal))
+testSynth2 now = do
+  f <- share $ now.freq
+  a <- share $ now.ampl
+  e <- share $ now.env -- note envelope current value
+  -- also apply a pitch envelope on top of vibrato
+  fWithVibrato  <- share $ adsr 0.01 0.0 0.05 0.01 0.0 1.0 1.0 * (f * (1 +| sinOsc 0.02 5))
+  let sinModulator1 = e * adsr 0.04 0.0 0.05 0.01 0.1 1.0 1.0 * triOsc 0.7 (5 *| f)
+      sinCarrier1   = sinOscPM a fWithVibrato sinModulator1
+      sinModulator2 = adsr 0.0 0.0 0.0 0.07 1.0 1.0 0.0 * triOsc 1.2 (7 *| f)
+      sinCarrier2   = sinOscPM a (2 *| fWithVibrato) sinModulator2
+      finalNode     = mono2stereo $ e * (sinCarrier1 + sinCarrier2)
+  pure finalNode
 
-testSynth3 :: Node e Now -> Node e (LR SynthVal)
-testSynth3 now = finalNode
-  where
-    f = now.freq
-    a = now.ampl
-    e = now.env
-    finalNode = lpf 1.0 6200 $ mono2stereo $ e * triOscPM a f (sqrOscDM 1.0 (7 *| f) (linearRamp 0.02 1 0))
+testSynth3 :: MonadHasDeltaTime m => Node e Now -> m (Node e (LR SynthVal))
+testSynth3 now = do
+  let f = now.freq
+      a = now.ampl
+      e = now.env
+  lpf 1.0 6200 $ mono2stereo $ e * triOscPM a f (sqrOscDM 1.0 (7 *| f) (linearRamp 0.02 1 0))
 
-testSynth4 :: Node e Now -> Node e (LR SynthVal)
-testSynth4 now = finalNode
-  where
-    f = share $ now.freq
-    a = now.ampl
-    e = share $ now.env -- note envelope current value
-    -- fWithVibrato = share $ (f * (nCents2ratio $ sinOsc 10 4))
-    fWithVibrato = f
-    sinModulator3 = adsr 0.015 0.0 0.01 0.01 0.5 1.0 0.5 * triOscPM (e) (3 *| fWithVibrato)
-      (triOsc (0.2 * e) (fWithVibrato))
+testSynth4 :: MonadHasSharing m => Node e Now -> m (Node e (LR SynthVal))
+testSynth4 now = do
+  f <- share $ now.freq
+  a <- pure $ now.ampl
+  e <- share $ now.env -- note envelope current value
+  -- fWithVibrato = share $ (f * (nCents2ratio $ sinOsc 10 4))
+  let fWithVibrato = f
+      sinModulator3 = adsr 0.015 0.0 0.01 0.01 0.5 1.0 0.5 * sinOsc (e) (6 *| fWithVibrato)
 
-    sinCarrier = sinOscPM (0.8 *| a) fWithVibrato sinModulator3
-    finalNode = lpf 1.0 6000 $  mono2stereo $ e * sinCarrier
+      sinCarrier = sinOscFbkPM (0.9 *| a) fWithVibrato sinModulator3 0.5
+      finalNode = mono2stereo $ e * sinCarrier
+  pure finalNode
 
 tonetestmain :: IO ()
 tonetestmain = do
@@ -262,8 +258,8 @@ tonetestmain = do
     -- (testSong3_part0, testSong3_part1) = testSong3
     -- mixed = playSong [(testSong3_part0, testSynth1), (testSong3_part1, testSynth3)]
     mixed = playSong testSong4
-    master = echo' 96 0.5 0.4 1.0 800 0.2 mixed
-    destNode = asPCM $ startAt 0.17 $ master
+    master = echo' 96 0.5 0.4 1.0 800 0.2 =<< mixed
+    destNode = asPCM <$> startAt 0.17 <$> master
 
   putStrLn "Opening audio"
   withAudio sampleRate bufferSize chanMode () destNode $ \hah -> do
