@@ -2,6 +2,7 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NoFieldSelectors #-}
+{-# OPTIONS_GHC -Wno-unused-top-binds #-}
 
 module Sound.Hailstone.Synth.Effect
 ( -- * Effects
@@ -16,9 +17,8 @@ where
 
 import Prelude hiding (isNaN)
 import Data.Functor ((<&>))
-import Control.Monad.IO.Class (liftIO, MonadIO)
 import Sound.Hailstone.Synth.Node
-import qualified Sound.Hailstone.Synth.DelayQueue as DelayQueue
+import qualified Sound.Hailstone.Synth.DelayQueue as DQ
 
 -- Effects must be either polymorphic or at least be specialized to @`LR` `SynthVal`@ rather
 -- than just SynthVal.
@@ -129,11 +129,23 @@ cookbookCoeffsFn_LPF d q f = let
 
 -- | RBJ 2nd-order filter. <https://webaudio.github.io/Audio-EQ-Cookbook/audio-eq-cookbook.html>
 -- Takes a coefficients-calculating function (which itself takes delta time, Q, frequency.)
-cookbookFilter :: MonadHasDeltaTime m => (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Freq -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+cookbookFilter
+  :: MonadHasDeltaTime m
+  => (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs)
+  -> SynthVal -- ^filter Q
+  -> Freq -- ^filter frequency
+  -> Node e (LR SynthVal) -- ^input node
+  -> m (Node e (LR SynthVal))
 cookbookFilter coeffsFn q f input = askDeltaTime <&> \d -> mkNode1 _cookbookFilter_s0 (_cookbookFilter_SF (coeffsFn d q f)) input
 
--- | `cookbookFilter` but with variable filter frequency from a node.
-cookbookFilterN :: MonadHasDeltaTime m => (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs) -> SynthVal -> Node e Freq -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+-- | `cookbookFilter` but with time-variable filter frequency from a node.
+cookbookFilterN
+  :: MonadHasDeltaTime m
+  => (TimeVal -> SynthVal -> Freq -> CookbookFilterCoeffs)
+  -> SynthVal -- ^filter Q
+  -> Node e Freq -- ^node of time-varying filter frequency
+  -> Node e (LR SynthVal) -- ^input node
+  -> m (Node e (LR SynthVal))
 cookbookFilterN coeffsFn q fNode input = askDeltaTime <&> \d -> MkNode2 _cookbookFilterN_s0 (_cookbookFilterN_SF d coeffsFn q) fNode input
 
 -- | 2nd-order low-pass filter.
@@ -150,33 +162,53 @@ lpfN = cookbookFilterN cookbookCoeffsFn_LPF
 -- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
 --
 -- (More efficient, fused implementation of `echo`.)
-echo' :: (MonadHasDeltaTime m, MonadIO m) => TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+echo' :: (MonadHasDeltaTime m, DQ.MonadHasDelayQueue m)
+      => TimeVal -- ^delay in milliseconds
+      -> Ampl -- ^feedback multiplier
+      -> Ampl -- ^wet mix level
+      -> SynthVal -- ^filter Q
+      -> Freq -- ^filter frequency
+      -> Pan -- ^pan applied to filtered, wet-level-scaled wet signal
+      -> Node e (LR SynthVal) -- ^input node
+      -> m (Node e (LR SynthVal))
 echo' delayMs decayMult wetLvl filterQ filterF wetPan input = do
   d <- askDeltaTime
   let delaySec = delayMs * 0.001
       dryLvl = max 0 (1 - wetLvl)
       filterCoeffs = cookbookCoeffsFn_LPF d filterQ filterF
-  dq0 <- liftIO $ DelayQueue.initDQ delaySec d zeroLR
+  dq0 <- DQ.initDQ delaySec d zeroLR
   pure $ flip (mkNode1IO (MkS2 dq0 _cookbookFilter_s0)) input $ \r x (MkS2 myDQ filterState) ->
-    DelayQueue.withDelay decayMult myDQ x $ \dq delayOut _ -> let
+    DQ.withDelay decayMult myDQ x $ \dq delayOut _ -> let
       (MkS2 filteredDelayOut filterState') = _cookbookFilter_SF filterCoeffs r delayOut filterState
       in pure $ MkS2 ((dryLvl .*: x) + balanceLR wetPan (wetLvl .*: filteredDelayOut)) (MkS2 dq filterState')
 
 -- | Single-stream echo with constant delay time and decay multiplier. This produces the raw
 -- echo wet signal; do your own mixing and filtering afterwards (or use `echo`.)
-echoRaw :: (MonadHasDeltaTime m, MonadIO m) => TimeVal -> Ampl -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+echoRaw :: (MonadHasDeltaTime m, DQ.MonadHasDelayQueue m)
+        => TimeVal -- ^delay in milliseconds
+        -> Ampl -- ^feedback multiplier
+        -> Node e (LR SynthVal) -- ^input node
+        -> m (Node e (LR SynthVal))
 echoRaw delayMs decayMult input = do
   let delaySec = delayMs * 0.001
   d <- askDeltaTime
-  dq0 <- liftIO $ DelayQueue.initDQ delaySec d zeroLR
+  dq0 <- DQ.initDQ delaySec d zeroLR
   pure $ flip (mkNode1IO dq0) input $ \_ x myDQ ->
-    DelayQueue.withDelay decayMult myDQ x $ \dq delayOut _ -> pure $ MkS2 delayOut dq
+    DQ.withDelay decayMult myDQ x $ \dq delayOut _ -> pure $ MkS2 delayOut dq
 
 -- | Single-stream echo with constant delay time, decay multiplier, wet mix level (0-1), low
 -- pass filter Q factor, cutoff frequency, and pan applied to the wet signal.
 --
 -- Less efficient but more readable and extensible implementation of `echo'`.
-echo :: (MonadHasDeltaTime m, MonadHasSharing m, MonadIO m) => TimeVal -> Ampl -> Ampl -> SynthVal -> Freq -> Pan -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+echo  :: (MonadHasDeltaTime m, MonadHasNodeSharing m, DQ.MonadHasDelayQueue m)
+      => TimeVal -- ^delay in milliseconds
+      -> Ampl -- ^feedback multiplier
+      -> Ampl -- ^wet mix level
+      -> SynthVal -- ^filter Q
+      -> Freq -- ^filter frequency
+      -> Pan -- ^pan applied to filtered, wet-level-scaled wet signal
+      -> Node e (LR SynthVal) -- ^input node
+      -> m (Node e (LR SynthVal))
 echo delayMs decayMult wetLvl filterQ filterF wetPan input = do
   input' <- share input
   filteredDelayOut <- lpf filterQ filterF =<< echoRaw delayMs decayMult input'

@@ -163,12 +163,12 @@ testSong4csb = do
   add $ at itvl (5/6 * 8.1/9 * cents2ratio (-400)) <> andThen step 2
   visit lo $ andThen step 1
 
-  b <- add $ go itvl (9/8)
+  d <- add $ go itvl (9/8)
   add $ go itvl (5/6)
   add $ go itvl (8/9)
   add $ go itvl (cents2ratio (-600)) <> at susX 0.2 <> andThen step 2
 
-  add $ go freq b.freq <> go susX 0.4 <> go itvl (cents2ratio (-400))
+  add $ go freq d.freq <> go susX 0.4 <> go itvl (cents2ratio (-400))
   add $ at itvl (5/6)
   add $ at itvl (3/4)
   add $ go itvl (5/8) <> andThen step 3
@@ -181,7 +181,7 @@ testSong4csb = do
   pure ()
 
 
-testSong4 :: MonadHasSharing m => [([Cell e], Node e Now -> m (Node e (LR SynthVal)))]
+testSong4 :: MonadHasNodeSharing m => [([Cell e], Node e Now -> m (Node e (LR SynthVal)))]
 testSong4 = realizeCellScript
   "fmkeys"
   (MkC { C.freq=370, C.ampl=0.8, C.start=0, C.dur=0.135, C.pan=0.5, C.adsr=(ADSR 0.005 0 0.21 0.1 0.5 1.0 0.0)})
@@ -197,7 +197,7 @@ testSynth0 now = pure finalNode
     -- pan = now.pan
     finalNode = mono2stereo $ e * sinOsc a (f * (1 +| sinOsc 0.02 (linearRamp 1.2 5 12)))
 
-testSynth1 :: MonadHasSharing m => Node e Now -> m (Node e (LR SynthVal))
+testSynth1 :: MonadHasNodeSharing m => Node e Now -> m (Node e (LR SynthVal))
 testSynth1 now = do
   f <- share $ now.freq
   a <- pure $ now.ampl
@@ -209,7 +209,7 @@ testSynth1 now = do
       finalNode = mono2stereo $ e * sinCarrier
   pure finalNode
 
-testSynth2 :: MonadHasSharing m => Node e Now -> m (Node e (LR SynthVal))
+testSynth2 :: MonadHasNodeSharing m => Node e Now -> m (Node e (LR SynthVal))
 testSynth2 now = do
   f <- share $ now.freq
   a <- share $ now.ampl
@@ -230,7 +230,7 @@ testSynth3 now = do
       e = now.env
   lpf 1.0 6200 $ mono2stereo $ e * triOscPM a f (sqrOscDM 1.0 (7 *| f) (linearRamp 0.02 1 0))
 
-testSynth4 :: MonadHasSharing m => Node e Now -> m (Node e (LR SynthVal))
+testSynth4 :: MonadHasNodeSharing m => Node e Now -> m (Node e (LR SynthVal))
 testSynth4 now = do
   f <- share $ now.freq
   a <- pure $ now.ampl
@@ -245,7 +245,7 @@ testSynth4 now = do
 
 tonetestmain :: IO ()
 tonetestmain = do
-  let sampleRate = 44100
+  let sampleRate = 48000
       bufferSize = 64
       chanMode = Stereo
 
@@ -259,7 +259,7 @@ tonetestmain = do
     -- mixed = playSong [(testSong3_part0, testSynth1), (testSong3_part1, testSynth3)]
     mixed = playSong testSong4
     master = echo' 96 0.5 0.4 1.0 800 0.2 =<< mixed
-    destNode = asPCM <$> startAt 0.17 <$> master
+    destNode = asPCM <$> startAt 0.2 <$> master
 
   putStrLn "Opening audio"
   withAudio sampleRate bufferSize chanMode () destNode $ \hah -> do

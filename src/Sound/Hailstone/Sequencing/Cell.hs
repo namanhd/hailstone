@@ -4,7 +4,7 @@
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 
 module Sound.Hailstone.Sequencing.Cell
-( Cell(..) )
+( Cell(..), ACell(..), promoteCtoAC', lowerAC'toAC )
 where
 
 import Sound.Hailstone.Synth.Node
@@ -32,7 +32,23 @@ data Cell e
     , env :: !(Node e Percent)
     }
 
+data ACell e = MkAC'
+  { freqs' :: !(Node e Freq)
+  , ampls' :: !(Node e Ampl)
+  , start' :: !TimeVal
+  , dur' :: !TimeVal
+  , pans' :: !(Node e Pan)
+  , env' :: !(Node e Percent)
+  }
+
 -- | for debug only!
 instance Show (Cell e) where
   show (MkC f a s d p e) = "MkC(" ++ show f ++ ", " ++ show a ++ ", " ++ show s ++ ", " ++ show d ++ ", " ++show p ++ ", "++ show e ++ ")"
   show (MkAC {}) = "MkAC <cannot show>"
+
+promoteCtoAC' :: Cell e -> ACell e
+promoteCtoAC' (MkC f a s d p e) = MkAC' (pure f) (pure a) s d (pure p) (adsr' e)
+promoteCtoAC' (MkAC f a s d p e) = MkAC' f a s d p e
+
+lowerAC'toAC :: ACell e -> Cell e
+lowerAC'toAC (MkAC' f a s d p e) = MkAC f a s d p e

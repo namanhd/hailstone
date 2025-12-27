@@ -57,14 +57,14 @@ data RetriggerMode = RetrigMonophonic | RetrigPolyphonic
 --
 -- Useful for when a `Now` needs to indicate a rest, as without this, the instrument is
 -- going to waste time on rendering yet its result will just be all 0 due to zero amplitude.
-guardByLCAmpl :: (Num a, Applicative m) => m (Node e a) -> Node e Now -> m (Node e a)
-{-# SPECIALIZE guardByLCAmpl :: Applicative m => m (Node e (LR SynthVal)) -> Node e Now -> m (Node e (LR SynthVal)) #-}
-guardByLCAmpl mNode nowNode = mNode <&> (\node -> flip (mkNode1IO node) nowNode $ \r lc myNode ->
-  if lc.ampl <= 0 then pure (MkS2 0 myNode) else runNode r myNode)
+guardByNowAmpl :: Num a => Node e Now -> Node e a -> Node e a
+{-# SPECIALIZE guardByNowAmpl :: Node e Now -> Node e (LR SynthVal) -> Node e (LR SynthVal) #-}
+guardByNowAmpl nowNode node = mkNode1IO node (\r lc myNode ->
+  if lc.ampl <= 0 then pure (MkS2 0 myNode) else runNode r myNode) nowNode
 
 -- | Play lists of `Cell`s with synths (a node parameterized by nodes of `Now` values).
 -- \"Resets and retriggers\" the instrument in sync with note data.
-retriggerWith :: (MonadHasSharing m)
+retriggerWith :: (MonadHasNodeSharing m)
               => EnvelopeCellDurationMode
               -> RetriggerMode -- ^monophonic or polyphonic triggering
               -> TimeVal -- ^a start time for this retriggering sequence
@@ -75,12 +75,11 @@ retriggerWith :: (MonadHasSharing m)
               -> m (Node e (LR SynthVal))
 retriggerWith envCellDurMode retrigMode t0 empt cellsInstrs = out
   where
-    ~mNodesDurs = sequenceA $ flip concatMap cellsInstrs $ 
+    ~mNodesDurs = sequenceA $ flip concatMap cellsInstrs $
       \(cells, instrument) -> cells <&> \cell -> do
         let (lc', sta, du) = renderCell envCellDurMode cell
         lc <- share lc'
-        node <- share =<< guardByLCAmpl (instrument lc) lc
-        pure (node, sta, du)
+        (\node -> (node, sta, du)) <$> (share =<< guardByNowAmpl lc <$> instrument lc)
     out = case retrigMode of
       RetrigMonophonic -> piecewiseMono t0 empt <$> sortOn (\(_, sta, _) -> sta) <$> mNodesDurs
       RetrigPolyphonic -> share =<< piecewisePoly t0 empt <$> mNodesDurs

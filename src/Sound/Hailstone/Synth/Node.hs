@@ -35,7 +35,7 @@ module Sound.Hailstone.Synth.Node
   -- *** Convenient derived constructors
 , mkNode1, mkNode1IO, mkNode3, mkNode4, mkNode4_
   -- ** Observable sharing
-, share
+, MonadHasNodeSharing(..)
   -- ** Consuming nodes at the audio backend
 , Sink(..), buildSink, runNode, iterateNode
   -- ** Basic operators
@@ -64,7 +64,8 @@ import Sound.Hailstone.Synth.LR
 import Sound.Hailstone.Synth.MiscTypes
 import Sound.Hailstone.Synth.NodeDefnCtx
 import qualified Sound.Hailstone.VoiceAlloc as VoiceAlloc
-import Data.IORef (readIORef, writeIORef)
+import Control.Monad.IO.Class (liftIO)
+import Data.IORef (newIORef, readIORef, writeIORef)
 
 -- for HasField passthrough
 import GHC.Records
@@ -115,17 +116,26 @@ There are a number of design decisions here...
 - Q: This is a binary tree... One usually hears of audio graphs, not audio node trees. Is it
   possible to represent audio node graphs i.e. forking a node output to feed multiple nodes?
 
-    - A: With some cursed magic to implement __observable sharing__ in `share`, yes. That is
-      the general way to hijack the host language's sharing to make it manifest in the EDSL.
+    - A: With the use of __observable sharing__, yes. That's the the general way to make the
+      host language's sharing manifest in the EDSL. See `MonadHasNodeSharing`.
 
-- Q: Why are there separate stateless and IO variants of `MkNode0` and `MkNode2`?
+- Q: Why are there so many separate stateless and IO constructor variants?
 
     - A: We can model `MkNode0_` and `MkNode2_` with the stateful counterparts, but this has
       some cost (the dummy state @()@ being created or passed around for function calls). We
-      try to be as efficient as possible, so we specialize as much as possible. We need `IO`
-      for nodes that work with unboxed buffers (such as delays); while we could do this with
-      `ST` monad behind the scenes and expose pure immutable arrays, this results in massive
-      ballooning of allocations (2 times as much) and too much GC pressure.
+      try to be as efficient as possible, so we specialize as much as possible.
+
+      We need `IO` for nodes that work with unboxed buffers (such as delays); while the @ST@
+      monad can be used behind the scenes only exposing pure immutable arrays, this still is
+      too allocation-heavy (2-3 times as much) with too much GC pressure.
+
+- Q: Why not parameterize the `Node` type by the monad of the signal functions, like what is
+  done with the node-combining (tree-building) functions? Why hard-code `IO` specifically?
+
+    - A: Unlike functions meant for /node definition time/ only executed when the node graph
+      gets defined (at the start or when it needs to be replaced), signal functions are very
+      hot paths that need to be as fast as possible. Signal functions with monad constraints
+      would need the typeclass dictionary passed to them every call, which is much overhead.
 -}
 data Node e x where
   MkNodeConst :: !x -> Node e x
@@ -270,20 +280,23 @@ data OshCache a = MkOshCached {-# UNPACK #-} !TimeVal !a | MkOshNothing
 -- and [implementation](https://github.com/HeinrichApfelmus/reactive-banana/blob/master/reactive-banana/src/Reactive/Banana/Prim/High/Cached.hs)
 -- of this approach (observable sharing had been described in papers prior.) These papers do
 -- this via `unsafePerformIO`; the monad here is just `IO` to avoid the unsafe call but I've
--- abstracted it out to an interface with only `newShareRef` to isolate it from general IO.
-share :: MonadHasSharing m => Node e x -> m (Node e x)
-share me@(MkNodeConst _) = pure me
-share ~node = newShareRef MkOshNothing <&> \ref -> MkNode0IO Nothing $
-  \r@(MkSigEnv { t = !t }) ~maybeMyNode -> readIORef ref >>= \case
+-- abstracted it out to an interface that exposes only `share`.
+class Monad m => MonadHasNodeSharing m where
+  share :: Node e x -> m (Node e x)
+
+instance MonadHasNodeSharing NodeDefnCtx where
+  share me@(MkNodeConst _) = pure me
+  share ~node = liftIO $ newIORef MkOshNothing <&> \ref -> MkNode0IO Nothing $
+    \r@(MkSigEnv { t = !t }) ~maybeMyNode -> readIORef ref >>= \case
     -- on cache miss, run (either the original node or our saved current version of it) then
     -- cache the result, then return it, and save (Just new_node) as our new saved state. If
     -- the cache hits, then the cache ALWAYS hits, because we come after the 1st instance of
     -- this shared node in the tree, our node state is always Nothing, runit never runs, and
     -- thereby guaranteeing that ONLY 1 copy of the shared node's tree is stored anywhere in
     -- the final tree.
-    (MkOshCached tc xc) | tc == t -> pure (MkS2 xc maybeMyNode)
-    _ -> runNode r (maybe node id maybeMyNode) >>= \(MkS2 x new_node) ->
-      writeIORef ref (MkOshCached t x) *> pure (MkS2 x (Just new_node))
+      (MkOshCached tc xc) | tc == t -> pure (MkS2 xc maybeMyNode)
+      _ -> runNode r (maybe node id maybeMyNode) >>= \(MkS2 x new_node) ->
+        writeIORef ref (MkOshCached t x) *> pure (MkS2 x (Just new_node))
 
 --------------------------------------------------------------------------------
 -- ** Consuming nodes at the audio backend
@@ -447,20 +460,13 @@ startAt sta = startWithDurAndEmpty 0 sta inf
 --------------------------------------------------------------------------------
 -- ** Numeric and stereo conversions
 
--- | Round and clip a node's output to the bounds allowed by the sample format.
-roundClip :: Node e (LR SynthVal) -> Node e (LR SampleVal)
--- roundClip :: (LRxNum v, RealFrac v, LRx samp, Bounded samp, Ord samp, Integral samp) => Node e (LR v) -> Node e (LR samp)
--- {-# SPECIALIZE roundClip :: Node e (LR SynthVal) -> Node e (LR SampleVal) #-}
-roundClip = fmap $ mapLR $ \v -> round
-  $ min (fromIntegral (maxBound :: SampleVal))
-  $ max (fromIntegral (minBound :: SampleVal)) v
-
 -- | Convert a double-generating signal into a signal of sample values expected by our audio
 -- setup (here, @Int16@), with scaling up to sample values followed by rounding and clipping
 asPCM :: Node e (LR SynthVal) -> Node e (LR SampleVal)
 -- asPCM :: (LRxNum v, RealFrac v) => Node e (LR v) -> Node e (LR SampleVal)
 -- {-# SPECIALIZE asPCM :: Node e (LR SynthVal) -> Node e (LR SampleVal) #-}
-asPCM = roundClip . (*|) (fromIntegral (maxBound :: SampleVal))
+asPCM = fmap $ mapLR $ \v ->
+  round $ fromIntegral (maxBound :: SampleVal) * (min 1.0 $ max (-1.0) $ v)
 
 sqrt2over2 :: SynthVal
 sqrt2over2 = 0.5 * sqrt 2
@@ -486,7 +492,7 @@ monosum = fmap hsumLR
 {-# INLINABLE monosum #-}
 
 -- | Lift a function on mono nodes to become a function on stereo nodes
-mapLRNode :: MonadHasSharing m => (Node e SynthVal -> Node e SynthVal) -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
+mapLRNode :: MonadHasNodeSharing m => (Node e SynthVal -> Node e SynthVal) -> Node e (LR SynthVal) -> m (Node e (LR SynthVal))
 mapLRNode f lrNode = do
   lrNode' <- share lrNode
   let lNode = f $ fmap (\lr -> withLR lr $ \l _ -> l) lrNode'

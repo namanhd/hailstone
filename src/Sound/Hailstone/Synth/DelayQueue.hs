@@ -6,10 +6,12 @@
 {-# OPTIONS_GHC -funbox-strict-fields #-}
 
 module Sound.Hailstone.Synth.DelayQueue
-(initDQ, withDelay)
+(MonadHasDelayQueue(..), withDelay)
 where
 
+import Control.Monad.IO.Class (liftIO)
 import qualified Data.Array.IO as IOA
+import Sound.Hailstone.Synth.NodeDefnCtx
 import Sound.Hailstone.Synth.SynthVal
 import Sound.Hailstone.Synth.LR
 import Sound.Hailstone.Synth.MiscTypes (SPair(..))
@@ -24,12 +26,15 @@ data DQ a = MkDQ
   , _len :: !Int
   }
 
-initDQ :: (IOA.MArray IOA.IOUArray a IO) => TimeVal -> TimeVal -> a -> IO (DQ a)
-{-# SPECIALIZE initDQ :: TimeVal -> TimeVal -> LR SynthVal -> IO (DQ (LR SynthVal)) #-}
-initDQ delaySec d empt = do
-  let n = round $ delaySec / d
-  arr <- IOA.newArray (0, n - 1) empt
-  pure $ MkDQ arr 1 0 n
+class Monad m => MonadHasDelayQueue m where
+  initDQ :: (IOA.MArray IOA.IOUArray a IO) => TimeVal -> TimeVal -> a -> m (DQ a)
+
+instance MonadHasDelayQueue NodeDefnCtx where
+  {-# SPECIALIZE initDQ :: TimeVal -> TimeVal -> LR SynthVal -> NodeDefnCtx (DQ (LR SynthVal)) #-}
+  initDQ delaySec d empt = do
+    let n = round $ delaySec / d
+    arr <- liftIO $ IOA.newArray (0, n - 1) empt
+    pure $ MkDQ arr 1 0 n
 
 -- | push an element to the queue
 push :: (IOA.MArray IOA.IOUArray a IO) => a -> DQ a -> IO (DQ a)
